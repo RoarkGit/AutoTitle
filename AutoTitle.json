@@ -1,0 +1,8 @@
+{
+  "Author": "RoarkGit",
+  "Name": "AutoTitle",
+  "Punchline": "Automatically change your title based on job, gearset, zone, or duty.",
+  "Description": "Set a default title plus rules that switch it when you change job or role, swap gearsets, enter a zone, or queue into a specific duty. Alts can have their own rules.",
+  "ApplicableVersion": "any",
+  "Tags": ["title", "automation", "job", "gearset", "duty", "quality of life"]
+}

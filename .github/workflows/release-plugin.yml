@@ -1,0 +1,100 @@
+name: Release Plugin
+
+# Triggered by pushing a version tag, e.g.:
+#   git tag v0.2.0 && git push origin v0.2.0
+# The tag (minus the leading "v") becomes AssemblyVersion, which Dalamud compares to decide an
+# update is available, so every release needs a new tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Download Dalamud
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile dalamud-latest.zip
+          Expand-Archive -Force dalamud-latest.zip "$env:RUNNER_TEMP\dalamud"
+          echo "DALAMUD_HOME=$env:RUNNER_TEMP\dalamud" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: bash
+        run: >
+          dotnet build AutoTitle.csproj
+          -c Release
+          -p:AssemblyVersion=${{ steps.ver.outputs.version }}
+          -p:Version=${{ steps.ver.outputs.version }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          files: bin/Release/AutoTitle/latest.zip
+          fail_on_unmatched_files: true
+
+      # pluginmaster.json lives in RoarkGit/DalamudPlugins, shared with other plugins, so this
+      # only touches the AutoTitle entry. GITHUB_TOKEN can't write to another repo, so this uses
+      # PLUGINMASTER_REPO_TOKEN: a fine-grained PAT with contents read/write on DalamudPlugins.
+      - name: Update pluginmaster.json in DalamudPlugins
+        shell: bash
+        env:
+          PLUGINMASTER_REPO_TOKEN: ${{ secrets.PLUGINMASTER_REPO_TOKEN }}
+        run: |
+          # Read the version back from the built manifest: a 3-part tag becomes 4 parts there.
+          built_version=$(python3 -c "import json; print(json.load(open('bin/Release/AutoTitle/AutoTitle.json'))['AssemblyVersion'])")
+
+          git clone "https://x-access-token:${PLUGINMASTER_REPO_TOKEN}@github.com/RoarkGit/DalamudPlugins.git" "$RUNNER_TEMP/dalamud-plugins"
+          cd "$RUNNER_TEMP/dalamud-plugins"
+
+          python3 - <<EOF
+          import json, time
+
+          with open("pluginmaster.json") as f:
+              data = json.load(f)
+
+          entry = next(e for e in data if e["InternalName"] == "AutoTitle")
+          entry["AssemblyVersion"] = "$built_version"
+          entry["LastUpdate"] = int(time.time())
+          url = "https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}/latest.zip"
+          entry["DownloadLinkInstall"] = url
+          entry["DownloadLinkUpdate"] = url
+          # The entry is seeded hidden until the first release exists.
+          entry["IsHide"] = False
+
+          with open("pluginmaster.json", "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pluginmaster.json
+          git commit -m "Update AutoTitle entry for ${{ steps.ver.outputs.tag }}"
+          git push origin main
