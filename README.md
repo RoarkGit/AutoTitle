@@ -14,6 +14,9 @@ Each rule has a title and one or more conditions. All of a rule's conditions hav
 to apply, and rules higher in the list win over rules below them. A condition can hold several
 values, and it matches if any of them do.
 
+A rule can also have several titles. AutoTitle picks one at random each time the rule takes over,
+and keeps it until a different rule does, you log in again, or you use Apply now.
+
 The conditions you can use are:
 
 - Job, either individual jobs or groups like tanks, healers, melee DPS, or Disciples of the Hand

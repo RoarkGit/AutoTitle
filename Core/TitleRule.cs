@@ -1,6 +1,6 @@
 namespace AutoTitle.Core;
 
-/// <summary>Stored in configs, so don't renumber. 2 was Map, removed in config version 2.</summary>
+/// <summary>Stored in configs, so don't renumber.</summary>
 public enum ConditionKind
 {
     Job = 0,
@@ -71,8 +71,11 @@ public sealed class TitleRule
     public string Name { get; set; } = "New rule";
     public bool Enabled { get; set; } = true;
 
-    /// <summary>0 means no title.</summary>
-    public ushort TitleId { get; set; }
+    /// <summary>
+    /// One is picked at random each time the rule takes over. 0 means no title, and so does an
+    /// empty list.
+    /// </summary>
+    public List<ushort> TitleIds { get; set; } = [];
 
     public List<RuleCondition> Conditions { get; set; } = [];
 }

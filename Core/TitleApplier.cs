@@ -45,6 +45,10 @@ public sealed unsafe class TitleApplier : IDisposable
     private DateTime? waitingSince;
     private CharacterProfile? profile;
     private bool waitingForTitleList;
+    // Where the current pick came from (a rule, or the source of a default), and whether the next
+    // evaluation should pick again even if that hasn't changed.
+    private object? pickedFrom;
+    private bool repick = true;
 
     /// <summary>Null while logged out.</summary>
     public GameContext? Context { get; private set; }
@@ -53,6 +57,9 @@ public sealed unsafe class TitleApplier : IDisposable
     public ulong CharacterId { get; private set; }
 
     public Resolution Resolution { get; private set; }
+
+    /// <summary>The title picked from <see cref="Resolution"/>, or null to leave the title alone.</summary>
+    public ushort? DesiredTitleId { get; private set; }
     public ushort? CurrentTitleId { get; private set; }
     public string Status { get; private set; } = "Waiting for login";
 
@@ -94,10 +101,14 @@ public sealed unsafe class TitleApplier : IDisposable
         scheduled?.Cancel();
     }
 
-    /// <summary>Sends the resolved title right away (subject to the cooldown) even if it hasn't changed.</summary>
+    /// <summary>
+    /// Picks again from rules with several titles and sends the result right away (subject to the
+    /// cooldown) even if it hasn't changed.
+    /// </summary>
     public void Reapply() => framework.RunOnTick(() =>
     {
         force = true;
+        repick = true;
         waitingSince = null;
         Evaluate();
         Schedule(Apply, TimeSpan.Zero);
@@ -161,6 +172,9 @@ public sealed unsafe class TitleApplier : IDisposable
         lastDesired = null;
         profile = null;
         waitingForTitleList = false;
+        DesiredTitleId = null;
+        pickedFrom = null;
+        repick = true;
         force = true;
         Status = "Waiting for login";
     }
@@ -196,7 +210,27 @@ public sealed unsafe class TitleApplier : IDisposable
         CurrentTitleId = gameData.CanonicalTitle(((Character*)player.Address)->TitleId);
         Context = Snapshot(player.ClassJob.RowId, player.Customize[(int)CustomizeIndex.Gender] == 1);
         Resolution = RuleEngine.Resolve(config, profile, Context.Value);
+        DesiredTitleId = PickTitle();
         return true;
+    }
+
+    /// <summary>
+    /// Picks one of the resolved titles at random, skipping locked ones. The pick is kept while the
+    /// same rule stays in effect, so it only changes when the rule takes over again.
+    /// </summary>
+    private ushort? PickTitle()
+    {
+        if (Resolution.Titles is not { } titles) return null;
+        var from = (object?)Resolution.Rule ?? Resolution.Source;
+
+        // With none usable, pick from all of them so Apply reports why.
+        var usable = titles.Where(t => IsUnlocked(t) == true).ToList();
+        if (usable.Count == 0) usable = [.. titles];
+
+        if (!repick && Equals(pickedFrom, from) && DesiredTitleId is { } kept && usable.Contains(kept)) return kept;
+        repick = false;
+        pickedFrom = from;
+        return usable[Random.Shared.Next(usable.Count)];
     }
 
     private void Apply()
@@ -215,7 +249,7 @@ public sealed unsafe class TitleApplier : IDisposable
             return;
         }
 
-        var desired = Resolution.TitleId;
+        var desired = DesiredTitleId;
         if (!force && desired == lastDesired) return;
 
         if (desired is not { } id)

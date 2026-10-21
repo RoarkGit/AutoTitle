@@ -1,7 +1,8 @@
 namespace AutoTitle.Core;
 
+/// <param name="Titles">The titles to pick from, or null to leave the title alone.</param>
 /// <param name="Source">"Shared", or the label of the character whose settings won.</param>
-public readonly record struct Resolution(TitleRule? Rule, ushort? TitleId, string Source);
+public readonly record struct Resolution(TitleRule? Rule, IReadOnlyList<ushort>? Titles, string Source);
 
 public static class RuleEngine
 {
@@ -17,15 +18,17 @@ public static class RuleEngine
         var shared = own == null || own.IncludeShared;
 
         if (own != null && FirstMatch(own.Rules, ctx) is { } ownRule)
-            return new Resolution(ownRule, ownRule.TitleId, own.Label);
+            return new Resolution(ownRule, TitlesOf(ownRule), own.Label);
         if (shared && FirstMatch(config.Rules, ctx) is { } sharedRule)
-            return new Resolution(sharedRule, sharedRule.TitleId, SharedSource);
+            return new Resolution(sharedRule, TitlesOf(sharedRule), SharedSource);
         if (own?.DefaultTitleId is { } ownDefault)
-            return new Resolution(null, ownDefault, own.Label);
+            return new Resolution(null, [ownDefault], own.Label);
         return shared
-            ? new Resolution(null, config.DefaultTitleId, SharedSource)
+            ? new Resolution(null, config.DefaultTitleId is { } id ? [id] : null, SharedSource)
             : new Resolution(null, null, own!.Label);
     }
+
+    public static IReadOnlyList<ushort> TitlesOf(TitleRule rule) => rule.TitleIds.Count > 0 ? rule.TitleIds : [0];
 
     private static TitleRule? FirstMatch(List<TitleRule> rules, GameContext ctx) =>
         rules.FirstOrDefault(r => r.Enabled && Matches(r, ctx));

@@ -21,6 +21,11 @@ public sealed class MainWindow : Window
     private readonly Plugin plugin;
     private bool dirty;
 
+    // The title list with "(No title)" in front, for the rule picker. Kept so the picker's width
+    // is only measured once per list.
+    private IReadOnlyList<Choice>? ruleTitles;
+    private bool ruleTitlesFeminine;
+
     /// <summary>Content id of the character whose settings are shown, or null for the shared ones.</summary>
     private ulong? selected;
 
@@ -117,8 +122,9 @@ public sealed class MainWindow : Window
 
         var res = applier.Resolution;
         var source = res.Rule is { } r ? $"rule \"{r.Name}\"" : "default";
-        var target = res.TitleId is { } id ? data.TitleLabel(id, ctx.Feminine) : "(leave unchanged)";
-        ImGui.TextUnformatted($"Wants: {target} via {source} ({res.Source})");
+        var target = applier.DesiredTitleId is { } id ? data.TitleLabel(id, ctx.Feminine) : "(leave unchanged)";
+        var pickedFrom = res.Titles is { Count: > 1 } titles ? $", picked from {titles.Count}" : "";
+        ImGui.TextUnformatted($"Wants: {target} via {source} ({res.Source}{pickedFrom})");
         ImGui.TextDisabled(applier.Status);
     }
 
@@ -285,12 +291,15 @@ public sealed class MainWindow : Window
         }
 
         ImGui.SameLine();
-        if (SearchCombo.Draw("##title", plugin.GameData.TitleLabel(rule.TitleId, Feminine),
-                plugin.GameData.Titles(Feminine), out var picked, 200 * ImGuiHelpers.GlobalScale, NoTitle))
+        var values = rule.TitleIds.Select(t => (uint)t).ToList();
+        if (SearchCombo.DrawMulti("##title", TitlesPreview(rule), RuleTitles(), values, 200 * ImGuiHelpers.GlobalScale))
         {
-            rule.TitleId = (ushort)picked;
+            rule.TitleIds = values.Select(t => (ushort)t).ToList();
             dirty = true;
         }
+        if (rule.TitleIds.Count > 1)
+            Tooltip("One is picked at random each time this rule takes over:\n"
+                    + string.Join("\n", rule.TitleIds.Select(t => plugin.GameData.TitleLabel(t, Feminine))));
 
         ImGui.SameLine();
         using (ImRaii.Disabled(index == 0))
@@ -354,19 +363,44 @@ public sealed class MainWindow : Window
         // Checked before priority, so a broken rule further down still stands out.
         var res = applier.Resolution;
         var winning = res.Rule == rule;
-        if (applier.IsUnlocked(rule.TitleId) == false)
+        var titles = RuleEngine.TitlesOf(rule);
+        var locked = titles.Where(t => applier.IsUnlocked(t) == false).ToList();
+        if (locked.Count == titles.Count)
         {
-            var title = plugin.GameData.TitleLabel(rule.TitleId, Feminine);
+            var what = titles.Count == 1 ? $"{TitleName(titles[0])} isn't" : "none of its titles are";
             return (RuleState.Blocked, winning
-                ? $"Would be active, but {title} isn't unlocked on this character, so the title is left alone."
-                : $"Conditions match, but {title} isn't unlocked on this character.");
+                ? $"Would be active, but {what} unlocked on this character, so the title is left alone."
+                : $"Conditions match, but {what} unlocked on this character.");
         }
+        var skipped = locked.Count > 0 ? $" Skipping {string.Join(", ", locked.Select(TitleName))}, not unlocked." : "";
         if (winning)
-            return (RuleState.Active, "Active: this rule's title is the one in use.");
+        {
+            var picked = titles.Count > 1 && applier.DesiredTitleId is { } id ? $" Picked {TitleName(id)}." : "";
+            return (RuleState.Active, $"Active: this rule's title is the one in use.{picked}{skipped}");
+        }
 
         var where = res.Source == RuleEngine.SharedSource ? "shared" : "character-specific";
         var winner = res.Rule is { } r ? $"{where} rule \"{r.Name}\"" : $"the {where} default";
-        return (RuleState.Outranked, $"Conditions match, but {winner} takes priority.");
+        return (RuleState.Outranked, $"Conditions match, but {winner} takes priority.{skipped}");
+    }
+
+    private string TitleName(ushort id) => plugin.GameData.TitleLabel(id, Feminine);
+
+    private string TitlesPreview(TitleRule rule) => rule.TitleIds.Count switch
+    {
+        0 => NoTitle.Label,
+        1 => TitleName(rule.TitleIds[0]),
+        var n => $"{n} titles (random)",
+    };
+
+    private IReadOnlyList<Choice> RuleTitles()
+    {
+        if (ruleTitles == null || ruleTitlesFeminine != Feminine)
+        {
+            ruleTitles = [NoTitle, .. plugin.GameData.Titles(Feminine)];
+            ruleTitlesFeminine = Feminine;
+        }
+        return ruleTitles;
     }
 
     private static void DrawRuleIcon(RuleState state, string message)

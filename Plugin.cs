@@ -34,9 +34,7 @@ public sealed class Plugin : IDalamudPlugin
     public Plugin()
     {
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        Config.Migrate();
         GameData = new GameData(DataManager);
-        Config.MergeValues(GameData);
         Applier = new TitleApplier(Config, GameData, Framework, ClientState, Objects, PlayerState, Condition, Inventory,
             DataManager, Chat, Log);
 
