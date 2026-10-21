@@ -1,49 +1,94 @@
 namespace AutoTitle.Core;
 
-/// <param name="Titles">The titles to pick from, or null to leave the title alone.</param>
-/// <param name="Source">"Shared", or the label of the character whose settings won.</param>
-public readonly record struct Resolution(TitleRule? Rule, IReadOnlyList<ushort>? Titles, string Source);
+// The result of checking the rules. Titles is null if the title should be left alone, and Source is
+// "Shared" or the label of the character whose settings won.
+public readonly record struct Resolution(
+    TitleRule? Rule,
+    IReadOnlyList<ushort>? Titles,
+    string Source
+);
 
 public static class RuleEngine
 {
     public const string SharedSource = "Shared";
 
     /// <summary>
-    /// Character rules, then shared rules, then the character's default, then the shared default.
-    /// The shared steps are skipped for a character with <see cref="CharacterProfile.IncludeShared"/> off.
+    /// Finds which rule applies. Checks the character's rules, then shared rules, then the
+    /// character's default, then the shared default.
     /// </summary>
-    public static Resolution Resolve(Configuration config, CharacterProfile? profile, GameContext ctx)
+    /// <param name="config">The plugin config</param>
+    /// <param name="profile">The current character's profile, if any</param>
+    /// <param name="ctx">The current game state</param>
+    public static Resolution Resolve(
+        Configuration config,
+        CharacterProfile? profile,
+        GameContext ctx
+    )
     {
-        var own = profile is { UseOwnRules: true } ? profile : null;
-        var shared = own == null || own.IncludeShared;
+        // Characters without their own rules just use the shared ones.
+        CharacterProfile? own = null;
+        if (profile != null && profile.UseOwnRules)
+            own = profile;
+        var useShared = own == null || own.IncludeShared;
 
-        if (own != null && FirstMatch(own.Rules, ctx) is { } ownRule)
-            return new Resolution(ownRule, TitlesOf(ownRule), own.Label);
-        if (shared && FirstMatch(config.Rules, ctx) is { } sharedRule)
-            return new Resolution(sharedRule, TitlesOf(sharedRule), SharedSource);
-        if (own?.DefaultTitleId is { } ownDefault)
-            return new Resolution(null, [ownDefault], own.Label);
-        return shared
-            ? new Resolution(null, config.DefaultTitleId is { } id ? [id] : null, SharedSource)
-            : new Resolution(null, null, own!.Label);
+        if (own != null)
+        {
+            var ownRule = FirstMatch(own.Rules, ctx);
+            if (ownRule != null)
+                return new Resolution(ownRule, TitlesOf(ownRule), own.Label);
+        }
+
+        if (useShared)
+        {
+            var sharedRule = FirstMatch(config.Rules, ctx);
+            if (sharedRule != null)
+                return new Resolution(sharedRule, TitlesOf(sharedRule), SharedSource);
+        }
+
+        // No rule matched, so fall back to the defaults.
+        if (own != null && own.DefaultTitleId != null)
+            return new Resolution(null, new[] { own.DefaultTitleId.Value }, own.Label);
+        if (!useShared)
+            return new Resolution(null, null, own!.Label);
+        if (config.DefaultTitleId != null)
+            return new Resolution(null, new[] { config.DefaultTitleId.Value }, SharedSource);
+        return new Resolution(null, null, SharedSource);
     }
 
-    public static IReadOnlyList<ushort> TitlesOf(TitleRule rule) => rule.TitleIds.Count > 0 ? rule.TitleIds : [0];
+    /// <summary>Gets a rule's titles, treating an empty list as "no title".</summary>
+    /// <param name="rule">The rule</param>
+    public static IReadOnlyList<ushort> TitlesOf(TitleRule rule)
+    {
+        if (rule.TitleIds.Count == 0)
+            return new ushort[] { 0 };
+        return rule.TitleIds;
+    }
 
-    private static TitleRule? FirstMatch(List<TitleRule> rules, GameContext ctx) =>
-        rules.FirstOrDefault(r => r.Enabled && Matches(r, ctx));
+    private static TitleRule? FirstMatch(List<TitleRule> rules, GameContext ctx)
+    {
+        foreach (var rule in rules)
+        {
+            if (rule.Enabled && Matches(rule, ctx))
+                return rule;
+        }
+        return null;
+    }
 
     /// <summary>
-    /// Every condition with values selected has to match. Empty conditions are ignored, but a rule
-    /// with nothing selected at all never matches, so a half-built rule can't match everywhere.
+    /// Checks if all of a rule's conditions match. Empty conditions are skipped, but a rule with
+    /// nothing selected at all never matches.
     /// </summary>
+    /// <param name="rule">The rule</param>
+    /// <param name="ctx">The current game state</param>
     public static bool Matches(TitleRule rule, GameContext ctx)
     {
         var any = false;
         foreach (var cond in rule.Conditions)
         {
-            if (cond.Values.Count == 0) continue;
-            if (!ctx.Matches(cond.Kind, cond.Values)) return false;
+            if (cond.Values.Count == 0)
+                continue;
+            if (!ctx.Matches(cond.Kind, cond.Values))
+                return false;
             any = true;
         }
         return any;

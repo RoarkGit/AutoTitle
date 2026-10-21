@@ -65,3 +65,10 @@ dotnet build -c Release
 ```
 
 Then add `bin/Release/AutoTitle.dll` under Dev Plugin Locations in `/xlsettings` > Experimental.
+
+Code is formatted with [CSharpier](https://csharpier.com), and CI fails if it isn't:
+
+```
+dotnet tool restore
+dotnet csharpier format .
+```

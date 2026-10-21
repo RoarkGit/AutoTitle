@@ -1,5 +1,5 @@
-using Dalamud.Configuration;
 using AutoTitle.Core;
+using Dalamud.Configuration;
 
 namespace AutoTitle;
 
@@ -11,13 +11,16 @@ public sealed class Configuration : IPluginConfiguration, IRuleSet
     public bool Enabled { get; set; } = true;
     public bool NotifyInChat { get; set; } = true;
 
-    /// <summary>Null leaves the title alone; 0 clears it.</summary>
+    // Null leaves the title alone, 0 removes it.
     public ushort? DefaultTitleId { get; set; }
 
-    public List<TitleRule> Rules { get; set; } = [];
+    public List<TitleRule> Rules { get; set; } = new();
 
-    /// <summary>Keyed by content id. Every character that logs in gets an entry.</summary>
-    public Dictionary<ulong, CharacterProfile> Characters { get; set; } = [];
+    // Keyed by content ID.
+    public Dictionary<ulong, CharacterProfile> Characters { get; set; } = new();
 
-    public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
+    public void Save()
+    {
+        Plugin.PluginInterface.SavePluginConfig(this);
+    }
 }

@@ -1,6 +1,6 @@
 namespace AutoTitle.Core;
 
-/// <summary>Stored in configs, so don't renumber.</summary>
+// Saved in configs, don't renumber.
 public enum ConditionKind
 {
     Job = 0,
@@ -10,7 +10,7 @@ public enum ConditionKind
     Gearset = 5,
 }
 
-/// <summary>Groups a Job condition can select instead of single jobs. Stored in configs, so don't renumber.</summary>
+// Saved in configs, don't renumber.
 public enum JobGroup : uint
 {
     None = 0,
@@ -28,10 +28,13 @@ public enum JobGroup : uint
 
 public static class JobGroups
 {
-    // Job condition values hold both ClassJob row ids and groups, so groups are offset past any job id.
+    // Job conditions store both ClassJob IDs and groups, so groups start after any job ID.
     public const uint IdBase = 1000;
 
-    public static uint ToValue(JobGroup group) => IdBase + (uint)group;
+    public static uint ToValue(JobGroup group)
+    {
+        return IdBase + (uint)group;
+    }
 }
 
 public interface IRuleSet
@@ -47,21 +50,24 @@ public sealed class CharacterProfile : IRuleSet
     public string World { get; set; } = "";
     public bool UseOwnRules { get; set; }
 
-    /// <summary>Check the shared rules and default after this character's own.</summary>
     public bool IncludeShared { get; set; } = true;
 
-    /// <summary>Null falls through to the shared default, or leaves the title alone without <see cref="IncludeShared"/>.</summary>
     public ushort? DefaultTitleId { get; set; }
 
-    public List<TitleRule> Rules { get; set; } = [];
+    public List<TitleRule> Rules { get; set; } = new();
 
-    /// <summary>
-    /// The game's unlocked title bitmask, saved whenever it has one so later sessions can check
-    /// titles without asking the server. Null until it has been loaded once for this character.
-    /// </summary>
+    // Unlocked title bitmask saved from the game, null until it's been loaded once.
     public List<byte>? UnlockedTitles { get; set; }
 
-    public string Label => World.Length > 0 ? $"{Name} @ {World}" : Name;
+    public string Label
+    {
+        get
+        {
+            if (World.Length == 0)
+                return Name;
+            return $"{Name} @ {World}";
+        }
+    }
 }
 
 [Serializable]
@@ -71,18 +77,15 @@ public sealed class TitleRule
     public string Name { get; set; } = "New rule";
     public bool Enabled { get; set; } = true;
 
-    /// <summary>
-    /// One is picked at random each time the rule takes over. 0 means no title, and so does an
-    /// empty list.
-    /// </summary>
-    public List<ushort> TitleIds { get; set; } = [];
+    // One is picked at random when the rule becomes active. Empty means no title.
+    public List<ushort> TitleIds { get; set; } = new();
 
-    public List<RuleCondition> Conditions { get; set; } = [];
+    public List<RuleCondition> Conditions { get; set; } = new();
 }
 
 [Serializable]
 public sealed class RuleCondition
 {
     public ConditionKind Kind { get; set; }
-    public List<uint> Values { get; set; } = [];
+    public List<uint> Values { get; set; } = new();
 }

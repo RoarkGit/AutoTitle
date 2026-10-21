@@ -1,4 +1,5 @@
 using System.Numerics;
+using AutoTitle.Core;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Colors;
@@ -6,27 +7,28 @@ using Dalamud.Interface.Components;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
-using AutoTitle.Core;
 
 namespace AutoTitle.Windows;
 
+/// <summary>
+/// The settings window, for editing rules and seeing which one is active.
+/// </summary>
 public sealed class MainWindow : Window
 {
     private static readonly Choice NoTitle = new(0, "(No title)");
 
-    // Picker id for leaving the default unset; title ids never get this high.
+    // ID for the "unset" option in the default title picker.
     private const uint UnsetId = uint.MaxValue;
     private static readonly ConditionKind[] Kinds = Enum.GetValues<ConditionKind>();
 
     private readonly Plugin plugin;
     private bool dirty;
 
-    // The title list with "(No title)" in front, for the rule picker. Kept so the picker's width
-    // is only measured once per list.
-    private IReadOnlyList<Choice>? ruleTitles;
+    // Title list with "(No title)" added, cached so its width only gets measured once.
+    private List<Choice>? ruleTitles;
     private bool ruleTitlesFeminine;
 
-    /// <summary>Content id of the character whose settings are shown, or null for the shared ones.</summary>
+    // The character whose settings are being edited, or null for shared settings.
     private ulong? selected;
 
     private enum RuleState
@@ -37,34 +39,76 @@ public sealed class MainWindow : Window
         Blocked,
     }
 
-    public MainWindow(Plugin plugin) : base("AutoTitle###autotitle_main")
+    public MainWindow(Plugin plugin)
+        : base("AutoTitle###autotitle_main")
     {
         this.plugin = plugin;
         Size = new Vector2(560, 520);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
 
-    private Configuration Cfg => plugin.Config;
-    private bool Feminine => plugin.Applier.Context?.Feminine ?? false;
+    private Configuration Cfg
+    {
+        get { return plugin.Config; }
+    }
 
-    private CharacterProfile? SelectedProfile =>
-        selected is { } id && Cfg.Characters.TryGetValue(id, out var p) ? p : null;
+    private bool Feminine
+    {
+        get
+        {
+            var ctx = plugin.Applier.Context;
+            return ctx != null && ctx.Value.Feminine;
+        }
+    }
 
-    private IRuleSet Editing => (IRuleSet?)SelectedProfile ?? Cfg;
+    private CharacterProfile? SelectedProfile
+    {
+        get
+        {
+            if (selected == null)
+                return null;
+            Cfg.Characters.TryGetValue(selected.Value, out var profile);
+            return profile;
+        }
+    }
 
-    // Another character's rules can't be checked against this character's job and zone.
-    private bool EditingCurrentCharacter => selected == null || selected == plugin.Applier.CharacterId;
+    // The rules and default being edited, either a character's or the shared ones.
+    private IRuleSet Editing
+    {
+        get
+        {
+            var profile = SelectedProfile;
+            if (profile != null)
+                return profile;
+            return Cfg;
+        }
+    }
 
-    private bool CurrentSkipsShared =>
-        Cfg.Characters.TryGetValue(plugin.Applier.CharacterId, out var p) && p is { UseOwnRules: true, IncludeShared: false };
+    // We can't show status for another character's rules.
+    private bool EditingCurrentCharacter
+    {
+        get { return selected == null || selected == plugin.Applier.CharacterId; }
+    }
+
+    private bool CurrentSkipsShared
+    {
+        get
+        {
+            if (!Cfg.Characters.TryGetValue(plugin.Applier.CharacterId, out var profile))
+                return false;
+            return profile.UseOwnRules && !profile.IncludeShared;
+        }
+    }
 
     public override void OnOpen()
     {
         plugin.Applier.LoadTitleList();
 
-        // Start on whichever settings are in effect for the logged-in character.
+        // Start on whichever settings the current character is using.
         var id = plugin.Applier.CharacterId;
-        selected = Cfg.Characters.TryGetValue(id, out var p) && p.UseOwnRules ? id : null;
+        selected = null;
+        if (Cfg.Characters.TryGetValue(id, out var profile) && profile.UseOwnRules)
+            selected = id;
     }
 
     public override void Draw()
@@ -77,7 +121,14 @@ public sealed class MainWindow : Window
 
         SeparatorText("Settings for");
         DrawProfilePicker();
-        if (SelectedProfile is not { } profile || DrawProfileOptions(profile))
+
+        // Characters that follow the shared rules have nothing else to edit.
+        var showRules = true;
+        var profile = SelectedProfile;
+        if (profile != null)
+            showRules = DrawProfileOptions(profile);
+
+        if (showRules)
         {
             SeparatorText("Default");
             DrawDefault();
@@ -87,18 +138,23 @@ public sealed class MainWindow : Window
             DrawRules();
         }
 
-        if (!dirty) return;
-        Cfg.Save();
-        plugin.Applier.Refresh();
+        // Save and re-check rules if anything changed.
+        if (dirty)
+        {
+            Cfg.Save();
+            plugin.Applier.Refresh();
+        }
     }
 
     private void DrawHeader()
     {
         var enabled = Cfg.Enabled;
-        if (ImGui.Checkbox("Enabled", ref enabled)) plugin.SetEnabled(enabled);
+        if (ImGui.Checkbox("Enabled", ref enabled))
+            plugin.SetEnabled(enabled);
 
         ImGui.SameLine();
-        if (ImGui.Button("Apply now")) plugin.Applier.Reapply();
+        if (ImGui.Button("Apply now"))
+            plugin.Applier.Reapply();
         Tooltip("Re-send the title for the current situation, e.g. after changing it by hand.");
 
         ImGui.SameLine();
@@ -110,50 +166,88 @@ public sealed class MainWindow : Window
         }
 
         var applier = plugin.Applier;
-        if (applier.Context is not { } ctx)
+        if (applier.Context == null)
         {
             ImGui.TextDisabled(applier.Status);
             return;
         }
-
+        var ctx = applier.Context.Value;
         var data = plugin.GameData;
-        var duty = ctx.DutyId != 0 ? $" | {data.Label(ConditionKind.Duty, ctx.DutyId)}" : "";
-        ImGui.TextDisabled($"{data.Label(ConditionKind.Job, ctx.JobId)} | {data.Label(ConditionKind.Zone, ctx.TerritoryId)}{duty}");
 
+        // Show current job/zone/duty.
+        var job = data.Label(ConditionKind.Job, ctx.JobId);
+        var zone = data.Label(ConditionKind.Zone, ctx.TerritoryId);
+        var where = $"{job} | {zone}";
+        if (ctx.DutyId != 0)
+            where += $" | {data.Label(ConditionKind.Duty, ctx.DutyId)}";
+        ImGui.TextDisabled(where);
+
+        // Show which title we want and why.
         var res = applier.Resolution;
-        var source = res.Rule is { } r ? $"rule \"{r.Name}\"" : "default";
-        var target = applier.DesiredTitleId is { } id ? data.TitleLabel(id, ctx.Feminine) : "(leave unchanged)";
-        var pickedFrom = res.Titles is { Count: > 1 } titles ? $", picked from {titles.Count}" : "";
-        ImGui.TextUnformatted($"Wants: {target} via {source} ({res.Source}{pickedFrom})");
+        var source = "default";
+        if (res.Rule != null)
+            source = $"rule \"{res.Rule.Name}\"";
+        var target = "(leave unchanged)";
+        if (applier.DesiredTitleId != null)
+            target = data.TitleLabel(applier.DesiredTitleId.Value, ctx.Feminine);
+        var from = res.Source;
+        if (res.Titles != null && res.Titles.Count > 1)
+            from += $", picked from {res.Titles.Count}";
+        ImGui.TextUnformatted($"Wants: {target} via {source} ({from})");
         ImGui.TextDisabled(applier.Status);
     }
 
     private void DrawProfilePicker()
     {
-        var current = plugin.Applier.CharacterId;
-        string Describe(ulong id, CharacterProfile p) =>
-            p.Label + (p.UseOwnRules ? " (own rules)" : "") + (id == current ? " [you]" : "");
+        var preview = "Shared (all characters)";
+        var profile = SelectedProfile;
+        if (profile != null)
+            preview = DescribeProfile(selected!.Value, profile);
 
-        var preview = SelectedProfile is { } sel ? Describe(selected!.Value, sel) : "Shared (all characters)";
         ImGui.SetNextItemWidth(300 * ImGuiHelpers.GlobalScale);
         using (var combo = ImRaii.Combo("##profile", preview))
         {
             if (combo)
             {
-                if (ImGui.Selectable("Shared (all characters)", selected == null)) selected = null;
-                foreach (var (id, p) in Cfg.Characters.OrderBy(kv => kv.Value.Label, StringComparer.OrdinalIgnoreCase))
+                if (ImGui.Selectable("Shared (all characters)", selected == null))
+                    selected = null;
+
+                var ids = Cfg.Characters.Keys.ToList();
+                ids.Sort(
+                    (a, b) =>
+                        string.Compare(
+                            Cfg.Characters[a].Label,
+                            Cfg.Characters[b].Label,
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                );
+                foreach (var id in ids)
                 {
-                    if (ImGui.Selectable($"{Describe(id, p)}##{id}", selected == id)) selected = id;
+                    var label = DescribeProfile(id, Cfg.Characters[id]);
+                    if (ImGui.Selectable($"{label}##{id}", selected == id))
+                        selected = id;
                 }
             }
         }
+
         ImGui.SameLine();
-        Hint(selected == null
-            ? "Applies to every character without rules of its own."
-            : "Characters appear here once they've logged in with AutoTitle installed.");
+        if (selected == null)
+            Hint("Applies to every character without rules of its own.");
+        else
+            Hint("Characters appear here once they've logged in with AutoTitle installed.");
     }
 
-    /// <returns>Whether the character uses its own rules, i.e. whether there's anything to edit below.</returns>
+    private string DescribeProfile(ulong id, CharacterProfile profile)
+    {
+        var label = profile.Label;
+        if (profile.UseOwnRules)
+            label += " (own rules)";
+        if (id == plugin.Applier.CharacterId)
+            label += " [you]";
+        return label;
+    }
+
+    // Returns whether the character uses its own rules, i.e. whether there's anything else to edit.
     private bool DrawProfileOptions(CharacterProfile profile)
     {
         var own = profile.UseOwnRules;
@@ -174,8 +268,11 @@ public sealed class MainWindow : Window
                 return false;
             }
         }
-        Tooltip("Hold Ctrl to remove this character and its rules.\nIt reappears, with no rules, next time it logs in.",
-            ImGuiHoveredFlags.AllowWhenDisabled);
+        Tooltip(
+            "Hold Ctrl to remove this character and its rules.\n"
+                + "It reappears, with no rules, next time it logs in.",
+            ImGuiHoveredFlags.AllowWhenDisabled
+        );
 
         if (!profile.UseOwnRules)
         {
@@ -189,22 +286,47 @@ public sealed class MainWindow : Window
             profile.IncludeShared = include;
             dirty = true;
         }
-        Hint(profile.IncludeShared
-            ? "This character's rules are checked first, then the shared rules, then the defaults."
-            : "Only this character's rules and default apply; shared settings are ignored.");
+        if (profile.IncludeShared)
+            Hint(
+                "This character's rules are checked first, then the shared rules, "
+                    + "then the defaults."
+            );
+        else
+            Hint("Only this character's rules and default apply, shared settings are ignored.");
         return true;
     }
 
     private void DrawDefault()
     {
-        // With shared fallback on, a character with no default of its own uses the shared one.
-        var unset = SelectedProfile is { IncludeShared: true } ? "(Use shared default)" : "(Don't change)";
+        // With shared fallback on, a character without its own default uses the shared one.
+        var unset = "(Don't change)";
+        var profile = SelectedProfile;
+        if (profile != null && profile.IncludeShared)
+            unset = "(Use shared default)";
+
         var set = Editing;
-        var preview = set.DefaultTitleId is { } id ? plugin.GameData.TitleLabel(id, Feminine) : unset;
-        if (SearchCombo.Draw("##default", preview, plugin.GameData.Titles(Feminine), out var picked, 300 * ImGuiHelpers.GlobalScale,
-                new Choice(UnsetId, unset), NoTitle))
+        var preview = unset;
+        if (set.DefaultTitleId != null)
+            preview = plugin.GameData.TitleLabel(set.DefaultTitleId.Value, Feminine);
+
+        var titles = plugin.GameData.Titles(Feminine);
+        var width = 300 * ImGuiHelpers.GlobalScale;
+        if (
+            SearchCombo.Draw(
+                "##default",
+                preview,
+                titles,
+                out var picked,
+                width,
+                new Choice(UnsetId, unset),
+                NoTitle
+            )
+        )
         {
-            set.DefaultTitleId = picked == UnsetId ? null : (ushort)picked;
+            if (picked == UnsetId)
+                set.DefaultTitleId = null;
+            else
+                set.DefaultTitleId = (ushort)picked;
             dirty = true;
         }
         ImGui.SameLine();
@@ -213,8 +335,10 @@ public sealed class MainWindow : Window
 
     private void DrawRules()
     {
-        Hint("Checked top to bottom, the first rule whose conditions all match wins. " +
-             "Within one condition, any listed value counts.");
+        Hint(
+            "Checked top to bottom, the first rule whose conditions all match wins. "
+                + "Within one condition, any listed value counts."
+        );
 
         var rules = Editing.Rules;
         if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Plus, "Add rule"))
@@ -223,7 +347,9 @@ public sealed class MainWindow : Window
             dirty = true;
         }
 
-        int? moveFrom = null, moveTo = null, delete = null;
+        var moveFrom = -1;
+        var moveTo = -1;
+        var delete = -1;
         for (var i = 0; i < rules.Count; i++)
         {
             using var id = ImRaii.PushId(rules[i].Id.ToString());
@@ -231,26 +357,34 @@ public sealed class MainWindow : Window
             DrawRule(rules[i], i, rules.Count, ref moveFrom, ref moveTo, ref delete);
         }
 
-        // Applied after the loop so the list isn't changed while it's being drawn.
-        if (moveFrom is { } from && moveTo is { } to)
+        // Do this after the loop so we don't modify the list while drawing it.
+        if (moveFrom != -1)
         {
-            (rules[from], rules[to]) = (rules[to], rules[from]);
+            var moved = rules[moveFrom];
+            rules[moveFrom] = rules[moveTo];
+            rules[moveTo] = moved;
             dirty = true;
         }
-        if (delete is { } del)
+        if (delete != -1)
         {
-            rules.RemoveAt(del);
+            rules.RemoveAt(delete);
             dirty = true;
         }
     }
 
-    /// <summary>
-    /// Draws a border around the rule by hand: this ImGui version can't auto-size a child window's
-    /// height, so a bordered child would fill the rest of the window.
-    /// </summary>
-    private void DrawRule(TitleRule rule, int index, int count, ref int? moveFrom, ref int? moveTo, ref int? delete)
+    // The border is drawn by hand since a bordered child can't auto-size its height and fills the
+    // window.
+    private void DrawRule(
+        TitleRule rule,
+        int index,
+        int count,
+        ref int moveFrom,
+        ref int moveTo,
+        ref int delete
+    )
     {
-        var pad = ImGui.GetStyle().WindowPadding.X / 2;
+        var style = ImGui.GetStyle();
+        var pad = style.WindowPadding.X / 2;
         var start = ImGui.GetCursorScreenPos();
         var right = start.X + ImGui.GetContentRegionAvail().X;
 
@@ -262,14 +396,24 @@ public sealed class MainWindow : Window
         ImGui.Unindent(pad);
 
         var bottom = ImGui.GetItemRectMax().Y + pad;
-        ImGui.GetWindowDrawList().AddRect(start, new Vector2(right, bottom),
-            ImGui.GetColorU32(ImGuiCol.Border), ImGui.GetStyle().FrameRounding);
+        var color = ImGui.GetColorU32(ImGuiCol.Border);
+        ImGui
+            .GetWindowDrawList()
+            .AddRect(start, new Vector2(right, bottom), color, style.FrameRounding);
         ImGui.Dummy(new Vector2(0, pad));
     }
 
-    private void DrawRuleBody(TitleRule rule, int index, int count, ref int? moveFrom, ref int? moveTo, ref int? delete)
+    private void DrawRuleBody(
+        TitleRule rule,
+        int index,
+        int count,
+        ref int moveFrom,
+        ref int moveTo,
+        ref int delete
+    )
     {
-        var (state, message) = GetRuleState(rule);
+        // Header row: status, enabled, name, titles, move/delete buttons.
+        var state = GetRuleState(rule, out var message);
         DrawRuleIcon(state, message);
         ImGui.SameLine();
 
@@ -291,113 +435,206 @@ public sealed class MainWindow : Window
         }
 
         ImGui.SameLine();
-        var values = rule.TitleIds.Select(t => (uint)t).ToList();
-        if (SearchCombo.DrawMulti("##title", TitlesPreview(rule), RuleTitles(), values, 200 * ImGuiHelpers.GlobalScale))
-        {
-            rule.TitleIds = values.Select(t => (ushort)t).ToList();
-            dirty = true;
-        }
-        if (rule.TitleIds.Count > 1)
-            Tooltip("One is picked at random each time this rule takes over:\n"
-                    + string.Join("\n", rule.TitleIds.Select(t => plugin.GameData.TitleLabel(t, Feminine))));
+        DrawRuleTitles(rule);
 
         ImGui.SameLine();
         using (ImRaii.Disabled(index == 0))
         {
-            if (ImGuiComponents.IconButton(FontAwesomeIcon.ArrowUp)) (moveFrom, moveTo) = (index, index - 1);
+            if (ImGuiComponents.IconButton(FontAwesomeIcon.ArrowUp))
+            {
+                moveFrom = index;
+                moveTo = index - 1;
+            }
         }
         ImGui.SameLine();
         using (ImRaii.Disabled(index == count - 1))
         {
-            if (ImGuiComponents.IconButton(FontAwesomeIcon.ArrowDown)) (moveFrom, moveTo) = (index, index + 1);
+            if (ImGuiComponents.IconButton(FontAwesomeIcon.ArrowDown))
+            {
+                moveFrom = index;
+                moveTo = index + 1;
+            }
         }
         ImGui.SameLine();
         using (ImRaii.Disabled(!ImGui.GetIO().KeyCtrl))
         {
-            if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash)) delete = index;
+            if (ImGuiComponents.IconButton(FontAwesomeIcon.Trash))
+                delete = index;
         }
-        Tooltip("Hold Ctrl to delete", ImGuiHoveredFlags.AllowWhenDisabled);
+        Tooltip("Hold Ctrl to delete.", ImGuiHoveredFlags.AllowWhenDisabled);
 
-        int? removeCondition = null;
-        for (var c = 0; c < rule.Conditions.Count; c++)
+        // Conditions.
+        var removeCondition = -1;
+        for (var i = 0; i < rule.Conditions.Count; i++)
         {
-            using var cid = ImRaii.PushId(c);
-            if (DrawCondition(rule.Conditions[c])) removeCondition = c;
+            using var id = ImRaii.PushId(i);
+            if (DrawCondition(rule.Conditions[i]))
+                removeCondition = i;
         }
-        if (removeCondition is { } rc)
+        if (removeCondition != -1)
         {
-            rule.Conditions.RemoveAt(rc);
+            rule.Conditions.RemoveAt(removeCondition);
             dirty = true;
         }
 
         if (ImGuiComponents.IconButtonWithText(FontAwesomeIcon.Plus, "Condition"))
         {
-            // Two conditions of the same kind would both have to match, so default to an unused kind.
-            var used = rule.Conditions.Select(x => x.Kind).ToHashSet();
-            rule.Conditions.Add(new RuleCondition { Kind = Kinds.FirstOrDefault(k => !used.Contains(k)) });
+            rule.Conditions.Add(new RuleCondition { Kind = UnusedKind(rule) });
             dirty = true;
         }
-        if (rule.Conditions.All(x => x.Values.Count == 0))
+
+        if (!HasAnyValues(rule))
         {
             ImGui.SameLine();
-            ImGui.TextColored(ImGuiColors.DalamudYellow, rule.Conditions.Count == 0
-                ? "Add a condition to use this rule."
-                : "Select a value for a condition to use this rule.");
+            if (rule.Conditions.Count == 0)
+                ImGui.TextColored(ImGuiColors.DalamudYellow, "Add a condition to use this rule.");
+            else
+                ImGui.TextColored(
+                    ImGuiColors.DalamudYellow,
+                    "Select a value for a condition to use this rule."
+                );
         }
     }
 
-    private (RuleState State, string Message) GetRuleState(TitleRule rule)
+    private void DrawRuleTitles(TitleRule rule)
+    {
+        // The picker works with uint IDs, titles are ushort.
+        var values = new List<uint>();
+        foreach (var id in rule.TitleIds)
+            values.Add(id);
+
+        var width = 200 * ImGuiHelpers.GlobalScale;
+        if (SearchCombo.DrawMulti("##title", TitlesPreview(rule), RuleTitles(), values, width))
+        {
+            rule.TitleIds.Clear();
+            foreach (var id in values)
+                rule.TitleIds.Add((ushort)id);
+            dirty = true;
+        }
+
+        if (rule.TitleIds.Count > 1)
+        {
+            var tip = "One is picked at random each time this rule takes over:";
+            foreach (var id in rule.TitleIds)
+                tip += "\n" + TitleName(id);
+            Tooltip(tip);
+        }
+    }
+
+    // Defaults new conditions to a kind the rule isn't using yet.
+    private static ConditionKind UnusedKind(TitleRule rule)
+    {
+        foreach (var kind in Kinds)
+        {
+            var used = false;
+            foreach (var cond in rule.Conditions)
+            {
+                if (cond.Kind == kind)
+                    used = true;
+            }
+            if (!used)
+                return kind;
+        }
+        return Kinds[0];
+    }
+
+    private static bool HasAnyValues(TitleRule rule)
+    {
+        foreach (var cond in rule.Conditions)
+        {
+            if (cond.Values.Count > 0)
+                return true;
+        }
+        return false;
+    }
+
+    private RuleState GetRuleState(TitleRule rule, out string message)
     {
         var applier = plugin.Applier;
-        if (applier.Context is not { } ctx || !EditingCurrentCharacter)
-            return (RuleState.Idle, "Status is shown for the character you're logged in as.");
+        if (applier.Context == null || !EditingCurrentCharacter)
+        {
+            message = "Only shown for your current character.";
+            return RuleState.Idle;
+        }
         if (!rule.Enabled)
-            return (RuleState.Idle, "Disabled.");
-        if (rule.Conditions.All(c => c.Values.Count == 0))
-            return (RuleState.Idle, "No conditions set yet.");
-        if (!RuleEngine.Matches(rule, ctx))
-            return (RuleState.Idle, "Conditions don't match right now.");
+        {
+            message = "Disabled.";
+            return RuleState.Idle;
+        }
+        if (!HasAnyValues(rule))
+        {
+            message = "No conditions set.";
+            return RuleState.Idle;
+        }
+        if (!RuleEngine.Matches(rule, applier.Context.Value))
+        {
+            message = "Doesn't match right now.";
+            return RuleState.Idle;
+        }
         if (selected == null && CurrentSkipsShared)
-            return (RuleState.Idle, "Conditions match, but this character doesn't use shared rules.");
+        {
+            message = "Matches, but this character doesn't use shared rules.";
+            return RuleState.Idle;
+        }
 
-        // Checked before priority, so a broken rule further down still stands out.
-        var res = applier.Resolution;
-        var winning = res.Rule == rule;
+        // Check this before priority so a broken rule further down still shows up red.
         var titles = RuleEngine.TitlesOf(rule);
-        var locked = titles.Where(t => applier.IsUnlocked(t) == false).ToList();
+        var locked = new List<string>();
+        foreach (var id in titles)
+        {
+            if (applier.IsUnlocked(id) == false)
+                locked.Add(TitleName(id));
+        }
         if (locked.Count == titles.Count)
         {
-            var what = titles.Count == 1 ? $"{TitleName(titles[0])} isn't" : "none of its titles are";
-            return (RuleState.Blocked, winning
-                ? $"Would be active, but {what} unlocked on this character, so the title is left alone."
-                : $"Conditions match, but {what} unlocked on this character.");
-        }
-        var skipped = locked.Count > 0 ? $" Skipping {string.Join(", ", locked.Select(TitleName))}, not unlocked." : "";
-        if (winning)
-        {
-            var picked = titles.Count > 1 && applier.DesiredTitleId is { } id ? $" Picked {TitleName(id)}." : "";
-            return (RuleState.Active, $"Active: this rule's title is the one in use.{picked}{skipped}");
+            if (titles.Count == 1)
+                message = $"{TitleName(titles[0])} isn't unlocked on this character.";
+            else
+                message = "None of these titles are unlocked on this character.";
+            return RuleState.Blocked;
         }
 
-        var where = res.Source == RuleEngine.SharedSource ? "shared" : "character-specific";
-        var winner = res.Rule is { } r ? $"{where} rule \"{r.Name}\"" : $"the {where} default";
-        return (RuleState.Outranked, $"Conditions match, but {winner} takes priority.{skipped}");
+        var skipped = "";
+        if (locked.Count > 0)
+            skipped = $"\nNot unlocked: {string.Join(", ", locked)}.";
+
+        var res = applier.Resolution;
+        if (res.Rule == rule)
+        {
+            message = "Active.";
+            if (titles.Count > 1 && applier.DesiredTitleId != null)
+                message = $"Active, picked {TitleName(applier.DesiredTitleId.Value)}.";
+            message += skipped;
+            return RuleState.Active;
+        }
+
+        var winner = "the default";
+        if (res.Rule != null)
+            winner = $"\"{res.Rule.Name}\"";
+        message = $"Matches, but {winner} takes priority.{skipped}";
+        return RuleState.Outranked;
     }
 
-    private string TitleName(ushort id) => plugin.GameData.TitleLabel(id, Feminine);
-
-    private string TitlesPreview(TitleRule rule) => rule.TitleIds.Count switch
+    private string TitleName(ushort id)
     {
-        0 => NoTitle.Label,
-        1 => TitleName(rule.TitleIds[0]),
-        var n => $"{n} titles (random)",
-    };
+        return plugin.GameData.TitleLabel(id, Feminine);
+    }
 
-    private IReadOnlyList<Choice> RuleTitles()
+    private string TitlesPreview(TitleRule rule)
+    {
+        if (rule.TitleIds.Count == 0)
+            return NoTitle.Label;
+        if (rule.TitleIds.Count == 1)
+            return TitleName(rule.TitleIds[0]);
+        return $"{rule.TitleIds.Count} titles (random)";
+    }
+
+    private List<Choice> RuleTitles()
     {
         if (ruleTitles == null || ruleTitlesFeminine != Feminine)
         {
-            ruleTitles = [NoTitle, .. plugin.GameData.Titles(Feminine)];
+            ruleTitles = new List<Choice> { NoTitle };
+            ruleTitles.AddRange(plugin.GameData.Titles(Feminine));
             ruleTitlesFeminine = Feminine;
         }
         return ruleTitles;
@@ -405,25 +642,36 @@ public sealed class MainWindow : Window
 
     private static void DrawRuleIcon(RuleState state, string message)
     {
-        var (icon, color) = state switch
+        var icon = FontAwesomeIcon.Minus;
+        var color = ImGuiColors.DalamudGrey3;
+        switch (state)
         {
-            RuleState.Active => (FontAwesomeIcon.Check, ImGuiColors.HealerGreen),
-            RuleState.Outranked => (FontAwesomeIcon.Check, ImGuiColors.DalamudYellow),
-            RuleState.Blocked => (FontAwesomeIcon.Times, ImGuiColors.DalamudRed),
-            _ => (FontAwesomeIcon.Minus, ImGuiColors.DalamudGrey3),
-        };
+            case RuleState.Active:
+                icon = FontAwesomeIcon.Check;
+                color = ImGuiColors.HealerGreen;
+                break;
+            case RuleState.Outranked:
+                icon = FontAwesomeIcon.Check;
+                color = ImGuiColors.DalamudYellow;
+                break;
+            case RuleState.Blocked:
+                icon = FontAwesomeIcon.Times;
+                color = ImGuiColors.DalamudRed;
+                break;
+        }
+
         ImGui.AlignTextToFramePadding();
         using (Plugin.PluginInterface.UiBuilder.IconFontFixedWidthHandle.Push())
             ImGui.TextColored(color, icon.ToIconString());
         Tooltip(message);
     }
 
-    /// <returns>Whether the condition's remove button was pressed.</returns>
+    // Returns whether the condition's remove button was clicked.
     private bool DrawCondition(RuleCondition cond)
     {
         var data = plugin.GameData;
         var removed = ImGuiComponents.IconButton(FontAwesomeIcon.Times);
-        Tooltip("Remove condition");
+        Tooltip("Remove condition.");
 
         ImGui.SameLine();
         ImGui.SetNextItemWidth(110 * ImGuiHelpers.GlobalScale);
@@ -431,11 +679,12 @@ public sealed class MainWindow : Window
         {
             if (combo)
             {
-                foreach (var k in Kinds)
+                foreach (var kind in Kinds)
                 {
-                    if (!ImGui.Selectable(KindName(k), k == cond.Kind) || k == cond.Kind) continue;
-                    // Values are ids from a different sheet per kind.
-                    cond.Kind = k;
+                    if (!ImGui.Selectable(KindName(kind), kind == cond.Kind) || kind == cond.Kind)
+                        continue;
+                    // Old values are IDs for the other kind, so clear them.
+                    cond.Kind = kind;
                     cond.Values.Clear();
                     dirty = true;
                 }
@@ -445,35 +694,44 @@ public sealed class MainWindow : Window
         if (cond.Kind == ConditionKind.Gearset)
         {
             ImGui.SameLine();
-            ImGuiComponents.HelpMarker("Matches by gearset number, as shown in the Gear Set List. Names shown are the " +
-                                       "logged-in character's; numbers mean different gearsets on different characters, " +
-                                       "so these usually belong in character-specific rules.");
+            ImGuiComponents.HelpMarker(
+                "Matches by gearset number, as shown in the Gear Set List. Names shown are the "
+                    + "logged-in character's, numbers mean different gearsets on different "
+                    + "characters, so these usually belong in character-specific rules."
+            );
         }
 
         ImGui.SameLine();
         ImGui.TextDisabled("is");
 
+        // Selected values, click one to remove it.
         uint? removeValue = null;
-        foreach (var v in cond.Values)
+        foreach (var value in cond.Values)
         {
-            var label = $"{data.Label(cond.Kind, v)}  x";
+            var label = $"{data.Label(cond.Kind, value)}  x";
             WrapFor(ImGui.CalcTextSize(label).X + ImGui.GetStyle().FramePadding.X * 2);
-            if (ImGui.SmallButton($"{label}##{v}")) removeValue = v;
-            Tooltip("Click to remove");
+            if (ImGui.SmallButton($"{label}##{value}"))
+                removeValue = value;
+            Tooltip("Click to remove.");
         }
-        if (removeValue is { } rv)
+        if (removeValue != null)
         {
-            cond.Values.Remove(rv);
+            cond.Values.Remove(removeValue.Value);
             dirty = true;
         }
 
         var addWidth = 140 * ImGuiHelpers.GlobalScale;
         WrapFor(addWidth);
-        if (SearchCombo.DrawMulti("##add", cond.Values.Count == 0 ? "Select..." : "Edit...",
-                data.Choices(cond.Kind), cond.Values, addWidth))
+        var addLabel = cond.Values.Count == 0 ? "Select..." : "Edit...";
+        if (
+            SearchCombo.DrawMulti("##add", addLabel, data.Choices(cond.Kind), cond.Values, addWidth)
+        )
             dirty = true;
 
-        var current = plugin.Applier.Context?.ValueFor(cond.Kind) ?? 0;
+        // Button to add whatever the current job/zone/etc. is.
+        uint current = 0;
+        if (plugin.Applier.Context != null)
+            current = plugin.Applier.Context.Value.ValueFor(cond.Kind);
         using (ImRaii.Disabled(current == 0 || cond.Values.Contains(current)))
         {
             ImGui.SameLine();
@@ -483,23 +741,26 @@ public sealed class MainWindow : Window
                 dirty = true;
             }
         }
-        if (current != 0) Tooltip(data.Label(cond.Kind, current), ImGuiHoveredFlags.AllowWhenDisabled);
+        if (current != 0)
+            Tooltip(data.Label(cond.Kind, current), ImGuiHoveredFlags.AllowWhenDisabled);
 
         return removed;
     }
 
-    /// <summary>SameLine, unless an item this wide wouldn't fit before the rule's border.</summary>
+    // SameLine, unless the next item won't fit.
     private static void WrapFor(float width)
     {
         ImGui.SameLine();
-        if (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().WindowPadding.X < width) ImGui.NewLine();
+        if (ImGui.GetContentRegionAvail().X - ImGui.GetStyle().WindowPadding.X < width)
+            ImGui.NewLine();
     }
 
-    private static string KindName(ConditionKind kind) => kind switch
+    private static string KindName(ConditionKind kind)
     {
-        ConditionKind.DutyType => "Duty type",
-        _ => kind.ToString(),
-    };
+        if (kind == ConditionKind.DutyType)
+            return "Duty type";
+        return kind.ToString();
+    }
 
     private static void SeparatorText(string label)
     {
@@ -517,7 +778,8 @@ public sealed class MainWindow : Window
 
     private static void Tooltip(string text, ImGuiHoveredFlags flags = ImGuiHoveredFlags.None)
     {
-        if (!ImGui.IsItemHovered(flags)) return;
+        if (!ImGui.IsItemHovered(flags))
+            return;
         using var tip = ImRaii.Tooltip();
         ImGui.TextUnformatted(text);
     }

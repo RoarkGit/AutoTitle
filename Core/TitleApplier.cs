@@ -3,7 +3,6 @@ using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.Inventory;
 using Dalamud.Game.Inventory.InventoryEventArgTypes;
-using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Character = FFXIVClientStructs.FFXIV.Client.Game.Character.Character;
@@ -11,31 +10,22 @@ using Character = FFXIVClientStructs.FFXIV.Client.Game.Character.Character;
 namespace AutoTitle.Core;
 
 /// <summary>
-/// Re-checks the rules when the game reports a change (job, zone, equipment, zoning, login)
-/// and sends the title they call for. A title is only sent when the resolved title changes or on
-/// login, so a title picked by hand sticks until something relevant changes.
+/// Checks the rules whenever something relevant changes in game and sends the title they pick.
 /// </summary>
 public sealed unsafe class TitleApplier : IDisposable
 {
-    // Minimum time between two sends, whatever triggered them.
+    // Minimum time between sends.
     private static readonly TimeSpan Cooldown = TimeSpan.FromSeconds(3);
-    // How long the server gets to apply a title before we report that it didn't. Never resent.
+
+    // How long to wait before checking whether a send worked.
     private static readonly TimeSpan ConfirmDelay = TimeSpan.FromSeconds(3);
-    // There's no event for the character finishing setup after a load, so that's re-checked each
-    // frame, giving up after this long.
+
+    // There's no event for the character finishing loading, so we retry every frame for up to
+    // this long.
     private static readonly TimeSpan LoadingTimeout = TimeSpan.FromSeconds(10);
 
     private readonly Configuration config;
     private readonly GameData gameData;
-    private readonly IFramework framework;
-    private readonly IClientState clientState;
-    private readonly IObjectTable objects;
-    private readonly IPlayerState playerState;
-    private readonly ICondition condition;
-    private readonly IGameInventory inventory;
-    private readonly IDataManager dataManager;
-    private readonly IChatGui chat;
-    private readonly IPluginLog log;
 
     private readonly CancellationTokenSource disposed = new();
     private CancellationTokenSource? scheduled;
@@ -45,122 +35,161 @@ public sealed unsafe class TitleApplier : IDisposable
     private DateTime? waitingSince;
     private CharacterProfile? profile;
     private bool waitingForTitleList;
-    // Where the current pick came from (a rule, or the source of a default), and whether the next
-    // evaluation should pick again even if that hasn't changed.
+
+    // The rule (or default) the current random pick came from.
     private object? pickedFrom;
     private bool repick = true;
 
-    /// <summary>Null while logged out.</summary>
+    /// <summary>The current job, zone, etc. Null while logged out.</summary>
     public GameContext? Context { get; private set; }
 
-    /// <summary>Content id of the logged-in character, 0 while logged out.</summary>
+    /// <summary>The logged in character's content ID, 0 while logged out.</summary>
     public ulong CharacterId { get; private set; }
-
     public Resolution Resolution { get; private set; }
 
-    /// <summary>The title picked from <see cref="Resolution"/>, or null to leave the title alone.</summary>
+    /// <summary>The title we want to be using, or null to leave it alone.</summary>
     public ushort? DesiredTitleId { get; private set; }
     public ushort? CurrentTitleId { get; private set; }
-    public string Status { get; private set; } = "Waiting for login";
+    public string Status { get; private set; } = "Not logged in.";
 
-    public TitleApplier(Configuration config, GameData gameData, IFramework framework, IClientState clientState,
-        IObjectTable objects, IPlayerState playerState, ICondition condition, IGameInventory inventory,
-        IDataManager dataManager, IChatGui chat, IPluginLog log)
+    public TitleApplier(Configuration config, GameData gameData)
     {
         this.config = config;
         this.gameData = gameData;
-        this.framework = framework;
-        this.clientState = clientState;
-        this.objects = objects;
-        this.playerState = playerState;
-        this.condition = condition;
-        this.inventory = inventory;
-        this.dataManager = dataManager;
-        this.chat = chat;
-        this.log = log;
 
-        clientState.Login += Reapply;
-        clientState.Logout += OnLogout;
-        clientState.ClassJobChanged += OnClassJobChanged;
-        clientState.TerritoryChanged += OnTerritoryChanged;
-        condition.ConditionChange += OnConditionChange;
-        inventory.InventoryChangedRaw += OnInventoryChanged;
+        Plugin.ClientState.Login += Reapply;
+        Plugin.ClientState.Logout += OnLogout;
+        Plugin.ClientState.ClassJobChanged += OnClassJobChanged;
+        Plugin.ClientState.TerritoryChanged += OnTerritoryChanged;
+        Plugin.Condition.ConditionChange += OnConditionChange;
+        Plugin.Inventory.InventoryChangedRaw += OnInventoryChanged;
 
-        if (clientState.IsLoggedIn) Reapply();
+        if (Plugin.ClientState.IsLoggedIn)
+            Reapply();
     }
 
     public void Dispose()
     {
-        clientState.Login -= Reapply;
-        clientState.Logout -= OnLogout;
-        clientState.ClassJobChanged -= OnClassJobChanged;
-        clientState.TerritoryChanged -= OnTerritoryChanged;
-        condition.ConditionChange -= OnConditionChange;
-        inventory.InventoryChangedRaw -= OnInventoryChanged;
+        Plugin.ClientState.Login -= Reapply;
+        Plugin.ClientState.Logout -= OnLogout;
+        Plugin.ClientState.ClassJobChanged -= OnClassJobChanged;
+        Plugin.ClientState.TerritoryChanged -= OnTerritoryChanged;
+        Plugin.Condition.ConditionChange -= OnConditionChange;
+        Plugin.Inventory.InventoryChangedRaw -= OnInventoryChanged;
         disposed.Cancel();
         scheduled?.Cancel();
     }
 
     /// <summary>
-    /// Picks again from rules with several titles and sends the result right away (subject to the
-    /// cooldown) even if it hasn't changed.
+    /// Sends the title for the current situation even if it hasn't changed, and re-rolls rules
+    /// with multiple titles.
     /// </summary>
-    public void Reapply() => framework.RunOnTick(() =>
+    public void Reapply()
     {
-        force = true;
-        repick = true;
-        waitingSince = null;
-        Evaluate();
-        Schedule(Apply, TimeSpan.Zero);
-    }, cancellationToken: disposed.Token);
+        Plugin.Framework.RunOnTick(
+            () =>
+            {
+                force = true;
+                repick = true;
+                waitingSince = null;
+                Evaluate();
+                Schedule(Apply, TimeSpan.Zero);
+            },
+            cancellationToken: disposed.Token
+        );
+    }
 
-    /// <summary>Re-checks the rules after a change.</summary>
-    public void Refresh() => framework.RunOnTick(() =>
+    /// <summary>Checks the rules again and sends the title if it changed.</summary>
+    public void Refresh()
     {
-        waitingSince = null;
-        Evaluate();
-        Schedule(Apply, TimeSpan.Zero);
-    }, cancellationToken: disposed.Token);
+        Plugin.Framework.RunOnTick(
+            () =>
+            {
+                waitingSince = null;
+                Evaluate();
+                Schedule(Apply, TimeSpan.Zero);
+            },
+            cancellationToken: disposed.Token
+        );
+    }
 
-    /// <summary>Null if this character's unlocked titles have never been loaded.</summary>
-    public bool? IsUnlocked(ushort id) => id == 0 ? true : UnlockedVariant(id) is { } v ? v != 0 : null;
+    /// <summary>Checks if the current character has a title unlocked.</summary>
+    /// <param name="id">The title's ID</param>
+    /// <returns>Whether the title is unlocked, or null if the title list isn't loaded.</returns>
+    public bool? IsUnlocked(ushort id)
+    {
+        // Everyone can have no title.
+        if (id == 0)
+            return true;
+
+        var variant = UnlockedVariant(id);
+        if (variant == null)
+            return null;
+        return variant != 0;
+    }
 
     /// <summary>
-    /// Asks the server for the unlocked title list if the game doesn't have it yet. Only called
-    /// when the settings window opens, so the request always follows something the player did.
+    /// Requests the unlocked title list if the game doesn't have it yet. This only gets called when
+    /// the settings window opens, so we never ask the server for anything on our own.
     /// </summary>
     public void LoadTitleList()
     {
         var ui = UIState.Instance();
-        if (!clientState.IsLoggedIn || ui == null) return;
-        if (ui->TitleList.DataReceived || ui->TitleList.DataPending || ui->TitleList.DataRequested) return;
-        ui->TitleList.RequestTitleList();
+        if (!Plugin.ClientState.IsLoggedIn || ui == null)
+            return;
+
+        var list = &ui->TitleList;
+        if (list->DataReceived || list->DataPending || list->DataRequested)
+            return;
+        list->RequestTitleList();
         waitingForTitleList = true;
     }
 
-    /// <summary>Called each frame the settings window is open, to apply the title once the list arrives.</summary>
+    /// <summary>
+    /// Called every frame the settings window is open, refreshes once the title list arrives.
+    /// </summary>
     public void CheckTitleList()
     {
-        if (!waitingForTitleList) return;
+        if (!waitingForTitleList)
+            return;
+
         var ui = UIState.Instance();
-        if (ui == null || !ui->TitleList.DataReceived) return;
+        if (ui == null || !ui->TitleList.DataReceived)
+            return;
         waitingForTitleList = false;
         Refresh();
     }
 
-    private void OnClassJobChanged(uint jobId) => Refresh();
-    private void OnTerritoryChanged(uint territoryId) => Refresh();
+    // Events
 
-    // Titles aren't sent while zoning or in a cutscene, so check again once that ends.
-    private void OnConditionChange(ConditionFlag flag, bool value)
+    private void OnClassJobChanged(uint jobId)
     {
-        if (!value && IsBusyFlag(flag)) Refresh();
+        Refresh();
     }
 
-    // There's no gearset event, but switching gearsets changes the equipped items.
+    private void OnTerritoryChanged(uint territoryId)
+    {
+        Refresh();
+    }
+
+    // We don't send while zoning or in a cutscene, so try again once those end.
+    private void OnConditionChange(ConditionFlag flag, bool value)
+    {
+        if (!value && IsBusyFlag(flag))
+            Refresh();
+    }
+
+    // There's no gearset event, but switching gearsets changes equipped items.
     private void OnInventoryChanged(IReadOnlyCollection<InventoryEventArgs> events)
     {
-        if (events.Any(e => e.Item.ContainerType == GameInventoryType.EquippedItems)) Refresh();
+        foreach (var e in events)
+        {
+            if (e.Item.ContainerType == GameInventoryType.EquippedItems)
+            {
+                Refresh();
+                return;
+            }
+        }
     }
 
     private void OnLogout(int type, int code)
@@ -169,65 +198,90 @@ public sealed unsafe class TitleApplier : IDisposable
         Context = null;
         CharacterId = 0;
         CurrentTitleId = null;
+        DesiredTitleId = null;
         lastDesired = null;
         profile = null;
         waitingForTitleList = false;
-        DesiredTitleId = null;
         pickedFrom = null;
         repick = true;
         force = true;
-        Status = "Waiting for login";
+        Status = "Not logged in.";
     }
 
-    /// <summary>Runs <paramref name="action"/> after <paramref name="delay"/>, replacing anything already scheduled.</summary>
+    // Applying titles
+
+    // Runs an action after a delay, cancelling anything that was already scheduled.
     private void Schedule(Action action, TimeSpan delay, int delayTicks = 0)
     {
         scheduled?.Cancel();
         scheduled = CancellationTokenSource.CreateLinkedTokenSource(disposed.Token);
-        framework.RunOnTick(action, delay, delayTicks, scheduled.Token);
+        Plugin.Framework.RunOnTick(action, delay, delayTicks, scheduled.Token);
     }
 
-    /// <summary>Runs <see cref="Apply"/> again next frame, unless we've been waiting longer than <see cref="LoadingTimeout"/>.</summary>
+    // Tries Apply again next frame, or returns false if we've been waiting too long.
     private bool RetryNextFrame()
     {
-        waitingSince ??= DateTime.UtcNow;
+        if (waitingSince == null)
+            waitingSince = DateTime.UtcNow;
+
         if (DateTime.UtcNow - waitingSince > LoadingTimeout)
         {
             waitingSince = null;
             return false;
         }
-        Schedule(Apply, TimeSpan.Zero, delayTicks: 1);
+        Schedule(Apply, TimeSpan.Zero, 1);
         return true;
     }
 
-    /// <summary>Reads the game state and resolves the rules. False while the character isn't loaded.</summary>
+    // Reads the current game state and checks the rules. Returns false if the character isn't
+    // loaded.
     private bool Evaluate()
     {
-        if (!clientState.IsLoggedIn || !playerState.IsLoaded || objects.LocalPlayer is not { } player) return false;
+        if (!Plugin.ClientState.IsLoggedIn || !Plugin.PlayerState.IsLoaded)
+            return false;
+        var player = Plugin.Objects.LocalPlayer;
+        if (player == null)
+            return false;
 
         profile = RecordCharacter();
         SaveTitleList(profile);
-        CurrentTitleId = gameData.CanonicalTitle(((Character*)player.Address)->TitleId);
-        Context = Snapshot(player.ClassJob.RowId, player.Customize[(int)CustomizeIndex.Gender] == 1);
+
+        var character = (Character*)player.Address;
+        CurrentTitleId = gameData.CanonicalTitle(character->TitleId);
+        var feminine = player.Customize[(int)CustomizeIndex.Gender] == 1;
+        Context = Snapshot(player.ClassJob.RowId, feminine);
         Resolution = RuleEngine.Resolve(config, profile, Context.Value);
         DesiredTitleId = PickTitle();
         return true;
     }
 
-    /// <summary>
-    /// Picks one of the resolved titles at random, skipping locked ones. The pick is kept while the
-    /// same rule stays in effect, so it only changes when the rule takes over again.
-    /// </summary>
+    // Picks a random title from the resolved ones, keeping the same pick while the same rule is
+    // active.
     private ushort? PickTitle()
     {
-        if (Resolution.Titles is not { } titles) return null;
-        var from = (object?)Resolution.Rule ?? Resolution.Source;
+        var titles = Resolution.Titles;
+        if (titles == null)
+            return null;
 
-        // With none usable, pick from all of them so Apply reports why.
-        var usable = titles.Where(t => IsUnlocked(t) == true).ToList();
-        if (usable.Count == 0) usable = [.. titles];
+        object from = Resolution.Source;
+        if (Resolution.Rule != null)
+            from = Resolution.Rule;
 
-        if (!repick && Equals(pickedFrom, from) && DesiredTitleId is { } kept && usable.Contains(kept)) return kept;
+        var usable = new List<ushort>();
+        foreach (var title in titles)
+        {
+            if (IsUnlocked(title) == true)
+                usable.Add(title);
+        }
+        // If nothing is unlocked, pick anyway so Apply can show why it isn't sending.
+        if (usable.Count == 0)
+            usable.AddRange(titles);
+
+        // Keep the last pick if the same rule is still active.
+        var keep = !repick && Equals(pickedFrom, from) && DesiredTitleId != null;
+        if (keep && usable.Contains(DesiredTitleId!.Value))
+            return DesiredTitleId;
+
         repick = false;
         pickedFrom = from;
         return usable[Random.Shared.Next(usable.Count)];
@@ -235,98 +289,96 @@ public sealed unsafe class TitleApplier : IDisposable
 
     private void Apply()
     {
-        if (!clientState.IsLoggedIn) return;
+        if (!Plugin.ClientState.IsLoggedIn)
+            return;
+
         if (!Evaluate())
         {
-            Status = RetryNextFrame() ? "Waiting for the character to load" : "Character didn't finish loading";
+            if (RetryNextFrame())
+                Status = "Waiting for character to load.";
+            else
+                Status = "Couldn't load character, try Apply now.";
             return;
         }
 
         if (!config.Enabled)
         {
-            Status = "Disabled";
+            Status = "Disabled.";
             force = true;
             return;
         }
 
+        // Only send when the title we want changes, unless forced.
         var desired = DesiredTitleId;
-        if (!force && desired == lastDesired) return;
+        if (!force && desired == lastDesired)
+            return;
 
-        if (desired is not { } id)
+        if (desired == null)
         {
-            Finish(desired, "No rule matches and no default title; leaving title alone");
+            Finish(null, "No rule matches, leaving title alone.");
             return;
         }
+        var id = desired.Value;
         if (CurrentTitleId == id)
         {
-            Finish(id, $"Title set to {TitleName(id)}");
+            Finish(id, $"Title set to {TitleName(id)}.");
             return;
         }
 
-        // The ConditionChange handler checks again once this ends.
         if (IsBusy())
         {
-            Status = "Waiting for zoning or cutscene to finish";
+            Status = "Waiting for zoning or a cutscene to finish.";
             return;
         }
 
+        // Check cooldown.
         var wait = lastSend + Cooldown - DateTime.UtcNow;
         if (wait > TimeSpan.Zero)
         {
-            Status = "Waiting a few seconds before changing the title again";
+            Status = "Waiting for cooldown.";
             Schedule(Apply, wait);
             return;
         }
 
         var ui = UIState.Instance();
-        if (ui == null) return;
-
-        // Titles sharing a name are offered as one; send whichever copy this character has.
-        var variant = id == 0 ? id : UnlockedVariant(id);
-        if (variant is not { } send || send == 0)
-        {
-            // Leave lastDesired unset so the next change checks again, once the list is loaded
-            // or in case the title was unlocked since.
-            waitingSince = null;
-            force = false;
-            lastDesired = null;
-            Status = variant == null
-                ? "Open AutoTitle's settings once on this character so it can load your unlocked titles"
-                : $"{TitleName(id)} is not unlocked on this character";
-            log.Warning(variant == null ? "Unlocked titles not loaded yet, skipping." : $"Title {id} is not unlocked, skipping.");
+        if (ui == null)
             return;
+
+        // Duplicate titles are shown as one, so send whichever copy we actually have.
+        ushort send = 0;
+        if (id != 0)
+        {
+            var variant = UnlockedVariant(id);
+            if (variant == null || variant == 0)
+            {
+                // Leave lastDesired unset so we try again on the next event.
+                waitingSince = null;
+                force = false;
+                lastDesired = null;
+                if (variant == null)
+                {
+                    Status = "Waiting for title list.";
+                    Plugin.Log.Warning("Unlocked titles not loaded yet, skipping.");
+                }
+                else
+                {
+                    Status = $"{TitleName(id)} isn't unlocked on this character.";
+                    Plugin.Log.Warning($"Title {id} is not unlocked, skipping.");
+                }
+                return;
+            }
+            send = variant.Value;
         }
 
         ui->TitleController.SendTitleIdUpdate(send);
         lastSend = DateTime.UtcNow;
-        Finish(id, "Setting title");
-        log.Debug($"Sent title {send}.");
-        framework.RunOnTick(() => Confirm(id), ConfirmDelay, cancellationToken: disposed.Token);
-    }
-
-    /// <summary>
-    /// The copy of a title this character has, or 0 if none. Uses the game's own list when it has
-    /// one this session (the Titles window or our settings window loaded it), otherwise the saved
-    /// one. Null if neither exists.
-    /// </summary>
-    private ushort? UnlockedVariant(ushort id)
-    {
-        var ui = UIState.Instance();
-        if (ui != null && CharacterId != 0 && ui->TitleList.DataReceived)
-            return gameData.TitleVariants(id).FirstOrDefault(v => ui->TitleList.IsTitleUnlocked(v));
-        if (profile?.UnlockedTitles is not { } saved) return null;
-        return gameData.TitleVariants(id).FirstOrDefault(v => v / 8 < saved.Count && (saved[v / 8] & (1 << (v % 8))) != 0);
-    }
-
-    /// <summary>Saves the game's unlocked title list once it has one, so later sessions don't have to ask for it.</summary>
-    private void SaveTitleList(CharacterProfile character)
-    {
-        var ui = UIState.Instance();
-        if (ui == null || !ui->TitleList.DataReceived) return;
-        var unlocked = ui->TitleList.UnlockedTitles;
-        if (character.UnlockedTitles is { } saved && unlocked.SequenceEqual(saved.ToArray())) return;
-        character.UnlockedTitles = [.. unlocked];
-        config.Save();
+        Finish(id, "Setting title...");
+        Plugin.Log.Debug($"Sent title {send}.");
+        Plugin.Framework.RunOnTick(
+            () => Confirm(id),
+            ConfirmDelay,
+            cancellationToken: disposed.Token
+        );
     }
 
     private void Finish(ushort? desired, string status)
@@ -337,81 +389,160 @@ public sealed unsafe class TitleApplier : IDisposable
         Status = status;
     }
 
+    // Checks that a sent title actually got set.
     private void Confirm(ushort id)
     {
-        // A newer change has taken over.
-        if (lastDesired != id || !Evaluate()) return;
+        // Something else changed since, so don't bother.
+        if (lastDesired != id || !Evaluate())
+            return;
 
         if (CurrentTitleId == id)
         {
-            Status = $"Title set to {TitleName(id)}";
+            Status = $"Title set to {TitleName(id)}.";
             Announce(id);
             return;
         }
-        Status = $"Server did not accept {TitleName(id)}";
-        log.Warning($"Title {id} was not applied.");
+        Status = $"Server didn't accept {TitleName(id)}.";
+        Plugin.Log.Warning($"Title {id} was not applied.");
     }
 
-    private bool IsBusy() =>
-        condition[ConditionFlag.BetweenAreas] || condition[ConditionFlag.BetweenAreas51]
-        || condition[ConditionFlag.OccupiedInCutSceneEvent] || condition[ConditionFlag.WatchingCutscene78];
+    // Title list
 
-    private static bool IsBusyFlag(ConditionFlag flag) =>
-        flag is ConditionFlag.BetweenAreas or ConditionFlag.BetweenAreas51
-            or ConditionFlag.OccupiedInCutSceneEvent or ConditionFlag.WatchingCutscene78;
+    // Finds the copy of a title we have unlocked, 0 if none, or null if there's no title list yet.
+    // The game's list is used if it has one, otherwise the one we saved.
+    private ushort? UnlockedVariant(ushort id)
+    {
+        var ui = UIState.Instance();
+        if (ui != null && CharacterId != 0 && ui->TitleList.DataReceived)
+        {
+            foreach (var variant in gameData.TitleVariants(id))
+            {
+                if (ui->TitleList.IsTitleUnlocked(variant))
+                    return variant;
+            }
+            return 0;
+        }
 
-    /// <summary>Adds a profile for a character the first time it's seen, and keeps its name and world current.</summary>
+        var saved = profile?.UnlockedTitles;
+        if (saved == null)
+            return null;
+        foreach (var variant in gameData.TitleVariants(id))
+        {
+            // The saved list is a bitmask, one bit per title ID.
+            var index = variant / 8;
+            var bit = 1 << (variant % 8);
+            if (index < saved.Count && (saved[index] & bit) != 0)
+                return variant;
+        }
+        return 0;
+    }
+
+    // Saves the game's title list so we don't need to request it again next session.
+    private void SaveTitleList(CharacterProfile character)
+    {
+        var ui = UIState.Instance();
+        if (ui == null || !ui->TitleList.DataReceived)
+            return;
+
+        var unlocked = ui->TitleList.UnlockedTitles.ToArray();
+        if (character.UnlockedTitles != null && unlocked.SequenceEqual(character.UnlockedTitles))
+            return;
+        character.UnlockedTitles = new List<byte>(unlocked);
+        config.Save();
+    }
+
+    // Game state
+
+    private bool IsBusy()
+    {
+        return Plugin.Condition[ConditionFlag.BetweenAreas]
+            || Plugin.Condition[ConditionFlag.BetweenAreas51]
+            || Plugin.Condition[ConditionFlag.OccupiedInCutSceneEvent]
+            || Plugin.Condition[ConditionFlag.WatchingCutscene78];
+    }
+
+    private static bool IsBusyFlag(ConditionFlag flag)
+    {
+        return flag == ConditionFlag.BetweenAreas
+            || flag == ConditionFlag.BetweenAreas51
+            || flag == ConditionFlag.OccupiedInCutSceneEvent
+            || flag == ConditionFlag.WatchingCutscene78;
+    }
+
+    // Creates a profile the first time a character logs in and keeps its name/world up to date.
     private CharacterProfile RecordCharacter()
     {
-        CharacterId = playerState.ContentId;
-        var name = playerState.CharacterName;
-        var world = playerState.HomeWorld.ValueNullable?.Name.ExtractText() ?? "";
+        CharacterId = Plugin.PlayerState.ContentId;
+        var name = Plugin.PlayerState.CharacterName;
+        var world = "";
+        var homeWorld = Plugin.PlayerState.HomeWorld.ValueNullable;
+        if (homeWorld != null)
+            world = homeWorld.Value.Name.ExtractText();
 
-        if (!config.Characters.TryGetValue(CharacterId, out var profile))
+        if (!config.Characters.TryGetValue(CharacterId, out var character))
         {
-            profile = new CharacterProfile();
-            config.Characters[CharacterId] = profile;
+            character = new CharacterProfile();
+            config.Characters[CharacterId] = character;
         }
-        if (profile.Name != name || profile.World != world)
+        if (character.Name != name || character.World != world)
         {
-            profile.Name = name;
-            profile.World = world;
+            character.Name = name;
+            character.World = world;
             config.Save();
         }
-        return profile;
+        return character;
     }
 
     private GameContext Snapshot(uint jobId, bool feminine)
     {
-        var territory = clientState.TerritoryType;
-        var duty = dataManager.GetExcelSheet<Lumina.Excel.Sheets.TerritoryType>()
-            .GetRowOrDefault(territory)?.ContentFinderCondition.ValueNullable;
-        return new GameContext(
-            JobId: jobId,
-            JobGroups: gameData.GroupsOf(jobId),
-            TerritoryId: gameData.Canonical(ConditionKind.Zone, territory),
-            DutyId: duty is { } d ? gameData.Canonical(ConditionKind.Duty, d.RowId) : 0,
-            DutyTypeId: duty is { } t ? gameData.DutyTypeOf(t) : 0,
-            Gearset: CurrentGearset(),
-            Feminine: feminine);
+        var terr = Plugin.ClientState.TerritoryType;
+        var zone = gameData.Canonical(ConditionKind.Zone, terr);
+
+        uint dutyId = 0;
+        uint dutyType = 0;
+        var row = Plugin
+            .DataManager.GetExcelSheet<Lumina.Excel.Sheets.TerritoryType>()
+            .GetRowOrDefault(terr);
+        var duty = row?.ContentFinderCondition.ValueNullable;
+        if (duty != null)
+        {
+            dutyId = gameData.Canonical(ConditionKind.Duty, duty.Value.RowId);
+            dutyType = gameData.DutyTypeOf(duty.Value);
+        }
+
+        var groups = gameData.GroupsOf(jobId);
+        return new GameContext(jobId, groups, zone, dutyId, dutyType, CurrentGearset(), feminine);
     }
 
-    /// <summary>The gearset number shown in game (index + 1), or 0 for none.</summary>
+    // Gearset number as shown in game (starting at 1), or 0 if none.
     private static uint CurrentGearset()
     {
-        var gearsets = RaptureGearsetModule.Instance();
-        if (gearsets == null) return 0;
-        var index = gearsets->CurrentGearsetIndex;
-        return gearsets->IsValidGearset(index) ? (uint)index + 1 : 0;
+        var gs = RaptureGearsetModule.Instance();
+        if (gs == null)
+            return 0;
+
+        var idx = gs->CurrentGearsetIndex;
+        if (!gs->IsValidGearset(idx))
+            return 0;
+        return (uint)idx + 1;
     }
 
     private void Announce(ushort id)
     {
-        if (!config.NotifyInChat) return;
-        var what = Resolution.Rule is { } rule ? $"rule \"{rule.Name}\"" : "default";
-        var why = Resolution.Source == RuleEngine.SharedSource ? what : $"{what}, character-specific";
-        chat.Print($"Title set to {TitleName(id)} ({why}).", "AutoTitle");
+        if (!config.NotifyInChat)
+            return;
+
+        var why = "default";
+        if (Resolution.Rule != null)
+            why = $"rule \"{Resolution.Rule.Name}\"";
+        if (Resolution.Source != RuleEngine.SharedSource)
+            why += ", character-specific";
+        Plugin.Chat.Print($"Title set to {TitleName(id)} ({why}).", "AutoTitle");
     }
 
-    private string TitleName(ushort id) => gameData.TitleLabel(id, Context?.Feminine ?? false);
+    private string TitleName(ushort id)
+    {
+        var feminine = Context != null && Context.Value.Feminine;
+        return gameData.TitleLabel(id, feminine);
+    }
 }

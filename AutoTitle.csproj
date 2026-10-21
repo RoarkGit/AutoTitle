@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Project Sdk="Dalamud.NET.Sdk/14.0.1">
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <Version>0.2.0.0</Version>
+    <Version>0.3.0.0</Version>
     <IsPackable>false</IsPackable>
     <DalamudApiLevel>15</DalamudApiLevel>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -10,7 +10,7 @@
 
   <ItemGroup>
     <!-- Dalamud reads the plugin icon from images/icon.png next to the dll (512x512 PNG).
-         Rasterised from images/icon.svg. -->
+         Exported from images/icon.xcf. -->
     <Content Include="images\icon.png">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

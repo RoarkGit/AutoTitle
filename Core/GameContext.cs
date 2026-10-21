@@ -7,23 +7,47 @@ public readonly record struct GameContext(
     uint DutyId,
     uint DutyTypeId,
     uint Gearset,
-    bool Feminine)
+    bool Feminine
+)
 {
-    /// <summary>The current value for a kind, or 0 when there isn't one (not in a duty, no gearset).</summary>
-    public uint ValueFor(ConditionKind kind) => kind switch
+    /// <summary>Gets the current value for a condition kind, or 0 if there isn't one.</summary>
+    /// <param name="kind">The condition kind</param>
+    public uint ValueFor(ConditionKind kind)
     {
-        ConditionKind.Job => JobId,
-        ConditionKind.Zone => TerritoryId,
-        ConditionKind.Duty => DutyId,
-        ConditionKind.DutyType => DutyTypeId,
-        ConditionKind.Gearset => Gearset,
-        _ => 0,
-    };
+        switch (kind)
+        {
+            case ConditionKind.Job:
+                return JobId;
+            case ConditionKind.Zone:
+                return TerritoryId;
+            case ConditionKind.Duty:
+                return DutyId;
+            case ConditionKind.DutyType:
+                return DutyTypeId;
+            case ConditionKind.Gearset:
+                return Gearset;
+            default:
+                return 0;
+        }
+    }
 
+    /// <summary>Checks if the current value for a condition kind is in the given values.</summary>
+    /// <param name="kind">The condition kind</param>
+    /// <param name="values">The values to check against</param>
     public bool Matches(ConditionKind kind, List<uint> values)
     {
+        // Job conditions can also list groups like "Tanks".
         if (kind == ConditionKind.Job)
-            return values.Contains(JobId) || JobGroups.Any(g => values.Contains(Core.JobGroups.ToValue(g)));
+        {
+            if (values.Contains(JobId))
+                return true;
+            foreach (var group in JobGroups)
+            {
+                if (values.Contains(Core.JobGroups.ToValue(group)))
+                    return true;
+            }
+            return false;
+        }
 
         var value = ValueFor(kind);
         return value != 0 && values.Contains(value);

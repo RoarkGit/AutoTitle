@@ -1,16 +1,21 @@
 using System.Globalization;
 using Dalamud.Game;
-using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Lumina.Excel.Sheets;
 
 namespace AutoTitle.Core;
 
-/// <param name="Section">Heading the picker lists this under, if any.</param>
-/// <param name="Hidden">Has a label (so saved values still display) but isn't offered in the picker.</param>
-public readonly record struct Choice(uint Id, string Label, string? Section = null, bool Hidden = false);
+// An entry in a picker. Hidden entries still have a label for saved values but aren't listed.
+public readonly record struct Choice(
+    uint Id,
+    string Label,
+    string? Section = null,
+    bool Hidden = false
+);
 
-/// <summary>Picker contents and labels, built from the Excel sheets on first use.</summary>
+/// <summary>
+/// Builds the picker lists and labels from the game's sheets.
+/// </summary>
 public sealed unsafe class GameData
 {
     private const uint CategoryWar = 30;
@@ -19,39 +24,42 @@ public sealed unsafe class GameData
     private const uint CategoryCrafter = 33;
     private const int MaxGearsets = 100;
 
-    /// <summary>Order of the Roles section, which also orders the job sections below it.</summary>
     private static readonly JobGroup[] GroupOrder =
     [
-        JobGroup.Tank, JobGroup.Healer, JobGroup.Dps, JobGroup.Melee, JobGroup.PhysicalRanged,
-        JobGroup.MagicalRanged, JobGroup.DiscipleOfWar, JobGroup.DiscipleOfMagic,
-        JobGroup.DiscipleOfTheHand, JobGroup.DiscipleOfTheLand,
+        JobGroup.Tank,
+        JobGroup.Healer,
+        JobGroup.Dps,
+        JobGroup.Melee,
+        JobGroup.PhysicalRanged,
+        JobGroup.MagicalRanged,
+        JobGroup.DiscipleOfWar,
+        JobGroup.DiscipleOfMagic,
+        JobGroup.DiscipleOfTheHand,
+        JobGroup.DiscipleOfTheLand,
     ];
 
-    /// <summary>
-    /// TerritoryIntendedUse values for open areas: cities, field zones, the Firmament, the Gold Saucer,
-    /// Island Sanctuary, and Cosmic Exploration. Housing is handled separately.
-    /// </summary>
+    // TerritoryIntendedUse values for towns, fields, the Firmament, the Gold Saucer, Island
+    // Sanctuary and Cosmic Exploration.
     private static readonly HashSet<uint> OpenZoneUses = [0, 1, 21, 23, 49, 60];
-    /// <summary>
-    /// Duty types left out of the duty lists: seasonal event duties (22), which only exist while the
-    /// event runs, and the Heavensward Diadem (23), which is no longer in the game.
-    /// </summary>
-    private static readonly HashSet<uint> OmittedDutyTypes = [22, 23];
-    // Blunderville, the Fall Guys collaboration, which only runs during the event.
-    private const uint DutyBlunderville = 958;
-    /// <summary>Gold Saucer areas that only exist during a collaboration: Blunderville Square and Keybound Square.</summary>
-    private static readonly HashSet<uint> OmittedZones = [1197, 1360];
-    /// <summary>
-    /// Not a real ContentType row. The Unreal trial is one duty that becomes a different fight every
-    /// patch, so it's offered as a type of its own rather than by name.
-    /// </summary>
-    public const uint DutyTypeUnreal = 10000;
     private const uint UseHousingWard = 13;
     private const uint UseHouseInterior = 14;
 
-    private readonly IDataManager data;
-    private readonly Dictionary<ConditionKind, Catalog> catalogs = [];
-    private readonly Dictionary<ConditionKind, Dictionary<uint, uint>> merged = [];
+    // Seasonal events (22) and the old Heavensward Diadem (23).
+    private static readonly HashSet<uint> OmittedDutyTypes = [22, 23];
+
+    // Fall Guys collab duty.
+    private const uint DutyBlunderville = 958;
+
+    // Blunderville Square and Keybound Square, which only exist during collab events.
+    private static readonly HashSet<uint> OmittedZones = [1197, 1360];
+
+    // Not a real ContentType. Unreal gets its own duty type since the fight changes every patch.
+    public const uint DutyTypeUnreal = 10000;
+
+    private readonly Dictionary<ConditionKind, Catalog> catalogs = new();
+
+    // Maps every ID of a merged zone or duty to the one it's stored as.
+    private readonly Dictionary<ConditionKind, Dictionary<uint, uint>> merged = new();
     private Catalog? titlesMasculine;
     private Catalog? titlesFeminine;
     private Dictionary<ushort, ushort[]>? titleVariants;
@@ -59,293 +67,557 @@ public sealed unsafe class GameData
     private HashSet<uint>? sharedDuties;
     private HashSet<uint>? unrealDuties;
 
-    public GameData(IDataManager data) => this.data = data;
+    // Conditions
 
-    public IReadOnlyList<Choice> Choices(ConditionKind kind) =>
-        kind == ConditionKind.Gearset ? Gearsets() : CatalogFor(kind).Items;
+    /// <summary>Gets the picker entries for a condition kind.</summary>
+    /// <param name="kind">The condition kind</param>
+    public IReadOnlyList<Choice> Choices(ConditionKind kind)
+    {
+        if (kind == ConditionKind.Gearset)
+            return Gearsets();
+        return CatalogFor(kind).Items;
+    }
 
+    /// <summary>Gets the display name for a condition value.</summary>
+    /// <param name="kind">The condition kind</param>
+    /// <param name="id">The value's ID</param>
     public string Label(ConditionKind kind, uint id)
     {
         if (kind == ConditionKind.Gearset)
-            return Gearsets().FirstOrDefault(c => c.Id == id).Label ?? $"{id:00}: (not on this character)";
-        return CatalogFor(kind).ById.TryGetValue(id, out var label) ? label : $"#{id}";
+        {
+            foreach (var gearset in Gearsets())
+            {
+                if (gearset.Id == id)
+                    return gearset.Label;
+            }
+            return $"{id:00}: (not on this character)";
+        }
+
+        if (CatalogFor(kind).ById.TryGetValue(id, out var label))
+            return label;
+        return $"#{id}";
     }
 
     /// <summary>
-    /// The id a zone or duty is stored and matched as. Some places are offered as one entry but
-    /// are several in the game: every housing ward, every house interior, and duties that share a
-    /// name (the Ocean Fishing routes, the Diadem, the Leap of Faith courses).
+    /// Gets the ID a zone or duty is stored as. Some entries cover several IDs, e.g. all housing
+    /// wards or all Ocean Fishing routes.
     /// </summary>
+    /// <param name="kind">The condition kind</param>
+    /// <param name="id">The zone or duty ID</param>
     public uint Canonical(ConditionKind kind, uint id)
     {
+        // Building the catalog fills in the merged IDs.
         CatalogFor(kind);
-        return merged.TryGetValue(kind, out var map) && map.TryGetValue(id, out var canonical) ? canonical : id;
+        if (merged.TryGetValue(kind, out var map) && map.TryGetValue(id, out var canonical))
+            return canonical;
+        return id;
     }
 
-    public IReadOnlyList<Choice> Titles(bool feminine) => TitleCatalog(feminine).Items;
+    // Titles
+
+    /// <summary>Gets the title picker entries.</summary>
+    /// <param name="feminine">Whether to use the feminine title names</param>
+    public IReadOnlyList<Choice> Titles(bool feminine)
+    {
+        return TitleCatalog(feminine).Items;
+    }
 
     /// <summary>
-    /// The id a title is stored and matched as. Some titles exist several times under the same
-    /// name (one per PvP season, for example), so those are offered once, as their lowest id.
+    /// Gets the ID a title is stored as. Some titles exist multiple times with the same name (one
+    /// per PvP season, for example), so we always use the lowest ID.
     /// </summary>
-    public ushort CanonicalTitle(ushort id) => TitleVariants(id)[0];
+    /// <param name="id">The title's ID</param>
+    public ushort CanonicalTitle(ushort id)
+    {
+        return TitleVariants(id)[0];
+    }
 
-    /// <summary>Every id sharing this title's name, lowest first; just the id itself for most titles.</summary>
+    /// <summary>Gets all IDs that share a title's name, lowest first.</summary>
+    /// <param name="id">The title's ID</param>
     public IReadOnlyList<ushort> TitleVariants(ushort id)
     {
-        titleVariants ??= data.GetExcelSheet<Title>()
-            .Where(t => !t.Masculine.IsEmpty)
-            .GroupBy(t => (t.Masculine.ExtractText(), t.Feminine.ExtractText()))
-            .Where(g => g.Count() > 1)
-            .SelectMany(g =>
+        if (titleVariants == null)
+        {
+            // Group title IDs by their masculine and feminine names.
+            var byName = new Dictionary<(string, string), List<ushort>>();
+            foreach (var title in Plugin.DataManager.GetExcelSheet<Title>())
             {
-                var ids = g.Select(t => (ushort)t.RowId).Order().ToArray();
-                return ids.Select(i => (i, ids));
-            })
-            .ToDictionary(x => x.i, x => x.ids);
-        return titleVariants.TryGetValue(id, out var ids) ? ids : [id];
+                if (title.Masculine.IsEmpty)
+                    continue;
+                var name = (title.Masculine.ExtractText(), title.Feminine.ExtractText());
+                if (!byName.TryGetValue(name, out var ids))
+                {
+                    ids = new List<ushort>();
+                    byName[name] = ids;
+                }
+                ids.Add((ushort)title.RowId);
+            }
+
+            // Only names with more than one ID need an entry.
+            titleVariants = new Dictionary<ushort, ushort[]>();
+            foreach (var ids in byName.Values)
+            {
+                if (ids.Count < 2)
+                    continue;
+                ids.Sort();
+                var variants = ids.ToArray();
+                foreach (var variant in variants)
+                    titleVariants[variant] = variants;
+            }
+        }
+
+        if (titleVariants.TryGetValue(id, out var found))
+            return found;
+        return new[] { id };
     }
 
-    public string TitleLabel(ushort id, bool feminine) => id == 0
-        ? "(No title)"
-        : TitleCatalog(feminine).ById.TryGetValue(id, out var label) ? label : $"Title #{id}";
+    /// <summary>Gets a title's display name.</summary>
+    /// <param name="id">The title's ID</param>
+    /// <param name="feminine">Whether to use the feminine title name</param>
+    public string TitleLabel(ushort id, bool feminine)
+    {
+        if (id == 0)
+            return "(No title)";
+        if (TitleCatalog(feminine).ById.TryGetValue(id, out var label))
+            return label;
+        return $"Title #{id}";
+    }
 
-    /// <summary>Every group a job belongs to, its main role first.</summary>
+    // Jobs
+
+    /// <summary>Gets every group a job belongs to, with its main role first.</summary>
+    /// <param name="jobId">The ClassJob ID</param>
     public IReadOnlyList<JobGroup> GroupsOf(uint jobId)
     {
-        jobGroups ??= data.GetExcelSheet<ClassJob>().ToDictionary(j => j.RowId, ClassifyGroups);
-        return jobGroups.TryGetValue(jobId, out var groups) ? groups : [];
+        if (jobGroups == null)
+        {
+            jobGroups = new Dictionary<uint, JobGroup[]>();
+            foreach (var job in Plugin.DataManager.GetExcelSheet<ClassJob>())
+                jobGroups[job.RowId] = ClassifyGroups(job);
+        }
+
+        if (jobGroups.TryGetValue(jobId, out var groups))
+            return groups;
+        return Array.Empty<JobGroup>();
     }
 
-    public static string GroupName(JobGroup group) => group switch
+    public static string GroupName(JobGroup group)
     {
-        JobGroup.Tank => "Tanks",
-        JobGroup.Healer => "Healers",
-        JobGroup.Melee => "Melee DPS",
-        JobGroup.PhysicalRanged => "Physical Ranged DPS",
-        JobGroup.MagicalRanged => "Magical Ranged DPS",
-        JobGroup.Dps => "All DPS",
-        JobGroup.DiscipleOfWar => "Disciples of War",
-        JobGroup.DiscipleOfMagic => "Disciples of Magic",
-        JobGroup.DiscipleOfTheHand => "Disciples of the Hand",
-        JobGroup.DiscipleOfTheLand => "Disciples of the Land",
-        _ => group.ToString(),
-    };
+        switch (group)
+        {
+            case JobGroup.Tank:
+                return "Tanks";
+            case JobGroup.Healer:
+                return "Healers";
+            case JobGroup.Melee:
+                return "Melee DPS";
+            case JobGroup.PhysicalRanged:
+                return "Physical Ranged DPS";
+            case JobGroup.MagicalRanged:
+                return "Magical Ranged DPS";
+            case JobGroup.Dps:
+                return "All DPS";
+            case JobGroup.DiscipleOfWar:
+                return "Disciples of War";
+            case JobGroup.DiscipleOfMagic:
+                return "Disciples of Magic";
+            case JobGroup.DiscipleOfTheHand:
+                return "Disciples of the Hand";
+            case JobGroup.DiscipleOfTheLand:
+                return "Disciples of the Land";
+            default:
+                return group.ToString();
+        }
+    }
 
     private static JobGroup[] ClassifyGroups(ClassJob job)
     {
         var category = job.ClassJobCategory.RowId;
-        if (category == CategoryCrafter) return [JobGroup.DiscipleOfTheHand];
-        if (category == CategoryGatherer) return [JobGroup.DiscipleOfTheLand];
+        if (category == CategoryCrafter)
+            return new[] { JobGroup.DiscipleOfTheHand };
+        if (category == CategoryGatherer)
+            return new[] { JobGroup.DiscipleOfTheLand };
 
-        // ClassJob.Role is 3 for both physical and magical ranged; the category tells them apart.
-        var role = job.Role switch
-        {
-            1 => JobGroup.Tank,
-            2 => JobGroup.Melee,
-            3 => category == CategoryMagic ? JobGroup.MagicalRanged : JobGroup.PhysicalRanged,
-            4 => JobGroup.Healer,
-            _ => JobGroup.None,
-        };
         var groups = new List<JobGroup>();
-        if (role != JobGroup.None) groups.Add(role);
-        if (role is JobGroup.Melee or JobGroup.PhysicalRanged or JobGroup.MagicalRanged) groups.Add(JobGroup.Dps);
-        if (category == CategoryWar) groups.Add(JobGroup.DiscipleOfWar);
-        if (category == CategoryMagic) groups.Add(JobGroup.DiscipleOfMagic);
+        switch (job.Role)
+        {
+            case 1:
+                groups.Add(JobGroup.Tank);
+                break;
+            case 2:
+                groups.Add(JobGroup.Melee);
+                groups.Add(JobGroup.Dps);
+                break;
+            case 3:
+                // Role is 3 for both physical and magical ranged, so check the category too.
+                if (category == CategoryMagic)
+                    groups.Add(JobGroup.MagicalRanged);
+                else
+                    groups.Add(JobGroup.PhysicalRanged);
+                groups.Add(JobGroup.Dps);
+                break;
+            case 4:
+                groups.Add(JobGroup.Healer);
+                break;
+        }
+
+        if (category == CategoryWar)
+            groups.Add(JobGroup.DiscipleOfWar);
+        if (category == CategoryMagic)
+            groups.Add(JobGroup.DiscipleOfMagic);
         return groups.ToArray();
     }
 
-    /// <summary>Read fresh each call, since gearsets change mid-session and differ per character.</summary>
+    // Not cached since gearsets can change mid-session.
     private static List<Choice> Gearsets()
     {
-        var module = RaptureGearsetModule.Instance();
-        if (module == null) return [];
         var list = new List<Choice>();
+        var module = RaptureGearsetModule.Instance();
+        if (module == null)
+            return list;
+
         for (var i = 0; i < MaxGearsets; i++)
         {
-            if (!module->IsValidGearset(i)) continue;
-            list.Add(new Choice((uint)i + 1, $"{i + 1:00}: {module->GetGearset(i)->NameString}"));
+            if (!module->IsValidGearset(i))
+                continue;
+            var name = module->GetGearset(i)->NameString;
+            list.Add(new Choice((uint)i + 1, $"{i + 1:00}: {name}"));
         }
         return list;
     }
 
+    // Building lists
+
     private Catalog TitleCatalog(bool feminine)
     {
-        ref var slot = ref feminine ? ref titlesFeminine : ref titlesMasculine;
-        return slot ??= Catalog.From(data.GetExcelSheet<Title>()
-            .Select(t => new Choice(t.RowId, (feminine ? t.Feminine : t.Masculine).ExtractText(),
-                Hidden: CanonicalTitle((ushort)t.RowId) != t.RowId)));
+        if (feminine && titlesFeminine != null)
+            return titlesFeminine;
+        if (!feminine && titlesMasculine != null)
+            return titlesMasculine;
+
+        var rows = new List<Choice>();
+        foreach (var title in Plugin.DataManager.GetExcelSheet<Title>())
+        {
+            var name = feminine ? title.Feminine.ExtractText() : title.Masculine.ExtractText();
+            // Duplicate titles are only listed once, under their lowest ID.
+            var hidden = CanonicalTitle((ushort)title.RowId) != title.RowId;
+            rows.Add(new Choice(title.RowId, name, Hidden: hidden));
+        }
+
+        var catalog = Catalog.From(rows, true);
+        if (feminine)
+            titlesFeminine = catalog;
+        else
+            titlesMasculine = catalog;
+        return catalog;
     }
 
     private Catalog CatalogFor(ConditionKind kind)
     {
-        if (catalogs.TryGetValue(kind, out var cached)) return cached;
-        var built = kind == ConditionKind.Job ? Catalog.From(BuildJobs(), sort: false) : Catalog.From(kind switch
-        {
-            ConditionKind.Zone => BuildZones(),
-            ConditionKind.Duty => BuildDuties(),
-            ConditionKind.DutyType => BuildDutyTypes(),
-            _ => [],
-        });
-        catalogs[kind] = built;
-        return built;
-    }
+        if (catalogs.TryGetValue(kind, out var cached))
+            return cached;
 
-    /// <summary>
-    /// Role groups, then jobs sectioned by main role in the game's own order. Combat base classes
-    /// (GLA, THM, ...) are hidden; crafters and gatherers are classes too but have no job form.
-    /// </summary>
-    private IEnumerable<Choice> BuildJobs()
-    {
-        foreach (var g in GroupOrder)
-            yield return new Choice(JobGroups.ToValue(g), GroupName(g), "Roles");
-
-        var jobs = data.GetExcelSheet<ClassJob>()
-            .Where(j => j.RowId != 0 && GroupsOf(j.RowId).Count > 0)
-            .OrderBy(j => Array.IndexOf(GroupOrder, GroupsOf(j.RowId)[0]))
-            .ThenBy(j => j.UIPriority);
-        foreach (var j in jobs)
+        Catalog catalog;
+        switch (kind)
         {
-            // Stored all lowercase ("blue mage").
-            var name = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(j.Name.ExtractText());
-            var isClass = j.JobIndex == 0 && j.ClassJobCategory.RowId is CategoryWar or CategoryMagic;
-            yield return new Choice(j.RowId, $"{name} ({j.Abbreviation.ExtractText()})",
-                GroupName(GroupsOf(j.RowId)[0]), Hidden: isClass);
+            case ConditionKind.Job:
+                // Jobs are already in the order we want.
+                catalog = Catalog.From(BuildJobs(), false);
+                break;
+            case ConditionKind.Zone:
+                catalog = Catalog.From(BuildZones(), true);
+                break;
+            case ConditionKind.Duty:
+                catalog = Catalog.From(BuildDuties(), true);
+                break;
+            case ConditionKind.DutyType:
+                catalog = Catalog.From(BuildDutyTypes(), true);
+                break;
+            default:
+                catalog = Catalog.From(new List<Choice>(), true);
+                break;
         }
+
+        catalogs[kind] = catalog;
+        return catalog;
     }
 
-    /// <summary>
-    /// Duties some zone links to (anything else can never match, since the duty is read from the
-    /// zone) that hold more than one player, so someone else is there to see the title.
-    /// </summary>
+    // Roles first, then jobs grouped by role. Base classes (GLA, THM, etc.) are hidden.
+    private List<Choice> BuildJobs()
+    {
+        var list = new List<Choice>();
+        foreach (var group in GroupOrder)
+            list.Add(new Choice(JobGroups.ToValue(group), GroupName(group), "Roles"));
+
+        var jobs = new List<ClassJob>();
+        foreach (var job in Plugin.DataManager.GetExcelSheet<ClassJob>())
+        {
+            if (job.RowId != 0 && GroupsOf(job.RowId).Count > 0)
+                jobs.Add(job);
+        }
+
+        // Sort by main role, then the game's own order within each role.
+        jobs.Sort(
+            (a, b) =>
+            {
+                var byRole = RoleOrder(a).CompareTo(RoleOrder(b));
+                if (byRole != 0)
+                    return byRole;
+                return a.UIPriority.CompareTo(b.UIPriority);
+            }
+        );
+
+        foreach (var job in jobs)
+        {
+            // Names are lowercase in the sheet ("blue mage").
+            var name = CultureInfo.InvariantCulture.TextInfo.ToTitleCase(job.Name.ExtractText());
+            var abbreviation = job.Abbreviation.ExtractText();
+            var category = job.ClassJobCategory.RowId;
+            var isClass =
+                job.JobIndex == 0 && (category == CategoryWar || category == CategoryMagic);
+            var section = GroupName(GroupsOf(job.RowId)[0]);
+            list.Add(new Choice(job.RowId, $"{name} ({abbreviation})", section, isClass));
+        }
+        return list;
+    }
+
+    private int RoleOrder(ClassJob job)
+    {
+        return Array.IndexOf(GroupOrder, GroupsOf(job.RowId)[0]);
+    }
+
+    // Duties with their own zone and more than one player, i.e. anywhere someone else can see
+    // your title.
     private HashSet<uint> SharedDuties()
     {
-        if (sharedDuties != null) return sharedDuties;
-        var duties = data.GetExcelSheet<ContentFinderCondition>();
-        sharedDuties = data.GetExcelSheet<TerritoryType>()
-            .Select(t => t.ContentFinderCondition.RowId)
-            .Where(id => id != 0 && duties.GetRowOrDefault(id) is { } duty && MaxPlayers(duty) > 1
-                && !duty.Name.IsEmpty && !OmittedDutyTypes.Contains(duty.ContentType.RowId) && id != DutyBlunderville)
-            .ToHashSet();
+        if (sharedDuties != null)
+            return sharedDuties;
+
+        sharedDuties = new HashSet<uint>();
+        var duties = Plugin.DataManager.GetExcelSheet<ContentFinderCondition>();
+        foreach (var zone in Plugin.DataManager.GetExcelSheet<TerritoryType>())
+        {
+            var id = zone.ContentFinderCondition.RowId;
+            if (id == 0 || id == DutyBlunderville)
+                continue;
+
+            var duty = duties.GetRowOrDefault(id);
+            if (duty == null || duty.Value.Name.IsEmpty)
+                continue;
+            if (MaxPlayers(duty.Value) < 2)
+                continue;
+            if (OmittedDutyTypes.Contains(duty.Value.ContentType.RowId))
+                continue;
+            sharedDuties.Add(id);
+        }
         return sharedDuties;
     }
 
-    /// <summary>Shared duties, with same-named ones merged into the lowest id.</summary>
-    private IEnumerable<Choice> BuildDuties()
+    // Same-named duties (Leap of Faith courses, Ocean Fishing routes, etc.) are merged into one
+    // entry.
+    private List<Choice> BuildDuties()
     {
-        var map = merged[ConditionKind.Duty] = [];
+        var list = new List<Choice>();
+        var map = new Dictionary<uint, uint>();
+        merged[ConditionKind.Duty] = map;
+
         var shared = SharedDuties();
-        var canonicalByName = new Dictionary<string, uint>();
-        foreach (var c in data.GetExcelSheet<ContentFinderCondition>())
+        var firstByName = new Dictionary<string, uint>();
+        foreach (var duty in Plugin.DataManager.GetExcelSheet<ContentFinderCondition>())
         {
-            var name = Capitalize(c.Name.ExtractText());
-            if (!shared.Contains(c.RowId) || IsUnreal(c.RowId))
+            var name = Capitalize(duty.Name.ExtractText());
+            if (!shared.Contains(duty.RowId) || IsUnreal(duty.RowId))
             {
-                yield return new Choice(c.RowId, name, Hidden: true);
+                list.Add(new Choice(duty.RowId, name, Hidden: true));
                 continue;
             }
-            if (!canonicalByName.TryAdd(name, c.RowId))
+
+            if (firstByName.TryGetValue(name, out var first))
             {
-                map[c.RowId] = canonicalByName[name];
+                map[duty.RowId] = first;
                 continue;
             }
-            yield return new Choice(c.RowId, name);
+            firstByName[name] = duty.RowId;
+            list.Add(new Choice(duty.RowId, name));
         }
+        return list;
     }
 
-    /// <summary>The duty's ContentType, or <see cref="DutyTypeUnreal"/> for the Unreal trial.</summary>
-    public uint DutyTypeOf(ContentFinderCondition duty) =>
-        IsUnreal(duty.RowId) ? DutyTypeUnreal : duty.ContentType.RowId;
+    /// <summary>Gets a duty's type, or <see cref="DutyTypeUnreal"/> for the Unreal.</summary>
+    /// <param name="duty">The duty</param>
+    public uint DutyTypeOf(ContentFinderCondition duty)
+    {
+        if (IsUnreal(duty.RowId))
+            return DutyTypeUnreal;
+        return duty.ContentType.RowId;
+    }
 
-    /// <summary>Nothing in the sheet marks the Unreal, so this goes by the English name in any client language.</summary>
+    // Nothing in the sheet marks a duty as Unreal, so check the English name instead.
     private bool IsUnreal(uint dutyId)
     {
-        unrealDuties ??= data.GetExcelSheet<ContentFinderCondition>(ClientLanguage.English)
-            .Where(c => c.Name.ExtractText().EndsWith("(Unreal)", StringComparison.Ordinal))
-            .Select(c => c.RowId)
-            .ToHashSet();
+        if (unrealDuties == null)
+        {
+            unrealDuties = new HashSet<uint>();
+            var duties = Plugin.DataManager.GetExcelSheet<ContentFinderCondition>(
+                ClientLanguage.English
+            );
+            foreach (var duty in duties)
+            {
+                if (duty.Name.ExtractText().EndsWith("(Unreal)", StringComparison.Ordinal))
+                    unrealDuties.Add(duty.RowId);
+            }
+        }
         return unrealDuties.Contains(dutyId);
     }
 
-    private static int MaxPlayers(ContentFinderCondition duty) =>
-        duty.ContentMemberType.ValueNullable is { } m ? m.MembersPerParty * m.PartyCount : 0;
-
-    /// <summary>Only types some listed duty has; most of the sheet is journal categories like Levequests.</summary>
-    private IEnumerable<Choice> BuildDutyTypes()
+    private static int MaxPlayers(ContentFinderCondition duty)
     {
-        var duties = data.GetExcelSheet<ContentFinderCondition>();
-        var used = SharedDuties().Select(id => DutyTypeOf(duties.GetRow(id))).ToHashSet();
-        return data.GetExcelSheet<ContentType>()
-            .Select(c => new Choice(c.RowId, c.Name.ExtractText(), Hidden: !used.Contains(c.RowId)))
-            .Append(new Choice(DutyTypeUnreal, "Unreal Trials", Hidden: !used.Contains(DutyTypeUnreal)));
+        var members = duty.ContentMemberType.ValueNullable;
+        if (members == null)
+            return 0;
+        return members.Value.MembersPerParty * members.Value.PartyCount;
     }
 
-    /// <summary>
-    /// Only open areas where other players can see you are listed. Duties have their own condition,
-    /// and the rest are story instances, solo quest battles, inn rooms, and copies used in cutscenes.
-    /// Hidden zones keep their labels so existing rules still read correctly. All housing wards
-    /// are one entry, and so are all house, apartment, and company interiors.
-    /// </summary>
-    private IEnumerable<Choice> BuildZones()
+    // Only list types that are used by at least one listed duty.
+    private List<Choice> BuildDutyTypes()
     {
-        var map = merged[ConditionKind.Zone] = [];
-        var zones = data.GetExcelSheet<TerritoryType>();
+        var duties = Plugin.DataManager.GetExcelSheet<ContentFinderCondition>();
+        var used = new HashSet<uint>();
+        foreach (var id in SharedDuties())
+            used.Add(DutyTypeOf(duties.GetRow(id)));
+
+        var list = new List<Choice>();
+        foreach (var type in Plugin.DataManager.GetExcelSheet<ContentType>())
+            list.Add(
+                new Choice(type.RowId, type.Name.ExtractText(), Hidden: !used.Contains(type.RowId))
+            );
+        list.Add(
+            new Choice(DutyTypeUnreal, "Unreal Trials", Hidden: !used.Contains(DutyTypeUnreal))
+        );
+        return list;
+    }
+
+    // Only lists open areas where other players can see you. All housing wards are one entry, and
+    // so are all house interiors.
+    private List<Choice> BuildZones()
+    {
+        var list = new List<Choice>();
+        var map = new Dictionary<uint, uint>();
+        merged[ConditionKind.Zone] = map;
+
+        var zones = Plugin.DataManager.GetExcelSheet<TerritoryType>();
+        // Place name and level files of every area listed so far, to skip old copies.
         var listed = new HashSet<(string, string)>();
-        foreach (var (use, label) in new[] { (UseHousingWard, "Housing ward"), (UseHouseInterior, "Inside a house") })
+
+        AddHousing(list, map, listed, zones, UseHousingWard, "Housing ward");
+        AddHousing(list, map, listed, zones, UseHouseInterior, "Inside a house");
+
+        // Go newest first so old copies of an area are the ones skipped.
+        foreach (var zone in zones.Reverse())
         {
-            var wards = zones.Where(t => t.TerritoryIntendedUse.RowId == use).ToList();
-            if (wards.Count == 0) continue;
-            var ids = wards.Select(t => t.RowId).ToList();
-            foreach (var t in wards)
-            {
-                map[t.RowId] = ids[0];
-                listed.Add((PlaceOf(t), t.Bg.ExtractText()));
-            }
-            yield return new Choice(ids[0], label);
+            var place = PlaceOf(zone);
+            if (place.Length == 0 || map.ContainsKey(zone.RowId))
+                continue;
+
+            // Add the duty name if it's different from the place name.
+            var label = place;
+            var duty = Capitalize(
+                zone.ContentFinderCondition.ValueNullable?.Name.ExtractText() ?? ""
+            );
+            if (duty.Length > 0 && !duty.Equals(place, StringComparison.OrdinalIgnoreCase))
+                label = $"{place} ({duty})";
+
+            var open =
+                zone.ContentFinderCondition.RowId == 0
+                && OpenZoneUses.Contains(zone.TerritoryIntendedUse.RowId)
+                && !OmittedZones.Contains(zone.RowId);
+            // Skip old copies of the same area (e.g. Mist).
+            if (open && !listed.Add((place, zone.Bg.ExtractText())))
+                open = false;
+
+            list.Add(new Choice(zone.RowId, label, Hidden: !open));
         }
-
-        foreach (var t in zones.Reverse())
-        {
-            var place = PlaceOf(t);
-            if (place.Length == 0 || map.ContainsKey(t.RowId)) continue;
-
-            // Duties often share a place name, so add the duty name when it differs.
-            var duty = Capitalize(t.ContentFinderCondition.ValueNullable?.Name.ExtractText() ?? "");
-            var label = duty.Length > 0 && !duty.Equals(place, StringComparison.OrdinalIgnoreCase)
-                ? $"{place} ({duty})"
-                : place;
-
-            // Some areas have an older copy with the same name and level files (e.g. Mist); list the newest.
-            var open = t.ContentFinderCondition.RowId == 0 && OpenZoneUses.Contains(t.TerritoryIntendedUse.RowId)
-                && !OmittedZones.Contains(t.RowId) && listed.Add((place, t.Bg.ExtractText()));
-            yield return new Choice(t.RowId, label, Hidden: !open);
-        }
+        return list;
     }
 
-    private static string PlaceOf(TerritoryType t) => t.PlaceName.ValueNullable?.Name.ExtractText() ?? "";
+    // Adds one entry covering every zone with the given intended use.
+    private static void AddHousing(
+        List<Choice> list,
+        Dictionary<uint, uint> map,
+        HashSet<(string, string)> listed,
+        IEnumerable<TerritoryType> zones,
+        uint use,
+        string label
+    )
+    {
+        uint? first = null;
+        foreach (var zone in zones)
+        {
+            if (zone.TerritoryIntendedUse.RowId != use)
+                continue;
+            first ??= zone.RowId;
+            map[zone.RowId] = first.Value;
+            listed.Add((PlaceOf(zone), zone.Bg.ExtractText()));
+        }
 
-    private static string Capitalize(string s) =>
-        s.Length > 0 && char.IsLower(s[0]) ? char.ToUpperInvariant(s[0]) + s[1..] : s;
+        if (first != null)
+            list.Add(new Choice(first.Value, label));
+    }
+
+    private static string PlaceOf(TerritoryType zone)
+    {
+        var place = zone.PlaceName.ValueNullable;
+        if (place == null)
+            return "";
+        return place.Value.Name.ExtractText();
+    }
+
+    private static string Capitalize(string s)
+    {
+        if (s.Length == 0 || !char.IsLower(s[0]))
+            return s;
+        return char.ToUpperInvariant(s[0]) + s.Substring(1);
+    }
 
     private sealed class Catalog
     {
-        public required List<Choice> Items { get; init; }
-        public required Dictionary<uint, string> ById { get; init; }
+        public List<Choice> Items = new();
+        public Dictionary<uint, string> ById = new();
 
-        /// <summary>Drops blank rows and appends the row id to labels listed more than once.</summary>
-        public static Catalog From(IEnumerable<Choice> rows, bool sort = true)
+        // Drops blank rows and adds the ID to duplicate labels.
+        public static Catalog From(List<Choice> rows, bool sort)
         {
-            var list = rows.Where(c => !string.IsNullOrWhiteSpace(c.Label)).ToList();
-            var dupes = list.Where(c => !c.Hidden).GroupBy(c => c.Label).Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet();
-            var items = list
-                .Select(c => dupes.Contains(c.Label) ? c with { Label = $"{c.Label} #{c.Id}" } : c)
-                .ToList();
-            if (sort) items.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Label, b.Label));
-            return new Catalog
+            var visibleCounts = new Dictionary<string, int>();
+            foreach (var row in rows)
             {
-                Items = items.Where(c => !c.Hidden).ToList(),
-                ById = items.ToDictionary(c => c.Id, c => c.Label),
-            };
+                if (row.Hidden || string.IsNullOrWhiteSpace(row.Label))
+                    continue;
+                visibleCounts.TryGetValue(row.Label, out var count);
+                visibleCounts[row.Label] = count + 1;
+            }
+
+            var items = new List<Choice>();
+            foreach (var row in rows)
+            {
+                if (string.IsNullOrWhiteSpace(row.Label))
+                    continue;
+                if (visibleCounts.TryGetValue(row.Label, out var count) && count > 1)
+                    items.Add(row with { Label = $"{row.Label} #{row.Id}" });
+                else
+                    items.Add(row);
+            }
+
+            if (sort)
+                items.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Label, b.Label));
+
+            var catalog = new Catalog();
+            foreach (var item in items)
+            {
+                catalog.ById[item.Id] = item.Label;
+                if (!item.Hidden)
+                    catalog.Items.Add(item);
+            }
+            return catalog;
         }
     }
 }

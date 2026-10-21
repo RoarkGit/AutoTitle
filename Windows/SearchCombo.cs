@@ -1,33 +1,49 @@
 using System.Numerics;
+using AutoTitle.Core;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
-using AutoTitle.Core;
 
 namespace AutoTitle.Windows;
 
-/// <summary>Combos with a search box, for lists too long to scroll (titles, zones).</summary>
+/// <summary>
+/// Combo boxes with a search filter, for lists too long to scroll through.
+/// </summary>
 internal static class SearchCombo
 {
     private const int MaxShown = 300;
     private const float MaxPopupWidth = 520;
     private const float ListHeight = 300;
 
-    // Only one combo popup can be open at a time, so they share one filter.
+    // Only one popup can be open at a time, so they all share one filter.
     private static string filter = "";
 
-    // Widest label per list. Catalog lists live for the session, so each is measured once; gearset
-    // lists are rebuilt every call, hence the size cap.
-    private static readonly Dictionary<IReadOnlyList<Choice>, float> LabelWidths =
-        new(ReferenceEqualityComparer.Instance);
+    // Widest label for each list. Gearset lists get rebuilt every call, so this is capped.
+    private static readonly Dictionary<IReadOnlyList<Choice>, float> LabelWidths = new(
+        ReferenceEqualityComparer.Instance
+    );
 
-    /// <param name="pinned">Always listed first and never filtered out, e.g. "(No title)".</param>
-    public static bool Draw(string id, string preview, IReadOnlyList<Choice> items, out uint picked,
-        float width = 0, params Choice[] pinned)
+    /// <summary>Draws a combo where one item can be picked.</summary>
+    /// <param name="id">The ImGui ID</param>
+    /// <param name="preview">Text shown in the closed combo</param>
+    /// <param name="items">The items to pick from</param>
+    /// <param name="picked">The picked item's ID</param>
+    /// <param name="width">The combo's width, or 0 for the default</param>
+    /// <param name="pinned">Items that are always listed first, e.g. "(No title)"</param>
+    /// <returns>Whether an item was picked.</returns>
+    public static bool Draw(
+        string id,
+        string preview,
+        IReadOnlyList<Choice> items,
+        out uint picked,
+        float width = 0,
+        params Choice[] pinned
+    )
     {
         picked = 0;
         using var combo = Begin(id, preview, items, pinned, width, 0);
-        if (!combo) return false;
+        if (!combo)
+            return false;
 
         ImGui.SetNextItemWidth(-1);
         ImGui.InputTextWithHint("##filter", "Search...", ref filter, 128);
@@ -35,27 +51,56 @@ internal static class SearchCombo
         var chosen = false;
         using (ImRaii.Child("##items", new Vector2(0, ListHeight * ImGuiHelpers.GlobalScale)))
         {
-            foreach (var c in pinned.Concat(Filtered(items, pinned.Length > 0)))
+            foreach (var item in pinned)
             {
-                if (!ImGui.Selectable($"{c.Label}##{c.Id}")) continue;
-                (chosen, picked) = (true, c.Id);
+                if (ImGui.Selectable($"{item.Label}##{item.Id}"))
+                {
+                    chosen = true;
+                    picked = item.Id;
+                }
             }
+
+            var matches = FilterItems(items, out var truncated);
+            foreach (var item in matches)
+            {
+                if (ImGui.Selectable($"{item.Label}##{item.Id}"))
+                {
+                    chosen = true;
+                    picked = item.Id;
+                }
+            }
+            DrawFilterNote(matches.Count == 0 && pinned.Length == 0, truncated);
         }
 
-        if (chosen) ImGui.CloseCurrentPopup();
+        if (chosen)
+            ImGui.CloseCurrentPopup();
         return chosen;
     }
 
-    /// <summary>Checkbox list that edits <paramref name="values"/> in place and stays open.</summary>
-    /// <returns>Whether <paramref name="values"/> changed.</returns>
-    public static bool DrawMulti(string id, string preview, IReadOnlyList<Choice> items, List<uint> values,
-        float width = 0)
+    /// <summary>Draws a combo with a checkbox for each item. Stays open while clicking.</summary>
+    /// <param name="id">The ImGui ID</param>
+    /// <param name="preview">Text shown in the closed combo</param>
+    /// <param name="items">The items to pick from</param>
+    /// <param name="values">The checked IDs, edited in place</param>
+    /// <param name="width">The combo's width, or 0 for the default</param>
+    /// <returns>Whether any values changed.</returns>
+    public static bool DrawMulti(
+        string id,
+        string preview,
+        IReadOnlyList<Choice> items,
+        List<uint> values,
+        float width = 0
+    )
     {
         var style = ImGui.GetStyle();
-        using var combo = Begin(id, preview, items, [], width, ImGui.GetFrameHeight() + style.ItemInnerSpacing.X);
-        if (!combo) return false;
+        // Leave room for the checkboxes.
+        var checkboxWidth = ImGui.GetFrameHeight() + style.ItemInnerSpacing.X;
+        using var combo = Begin(id, preview, items, Array.Empty<Choice>(), width, checkboxWidth);
+        if (!combo)
+            return false;
 
-        ImGui.SetNextItemWidth(-ImGui.CalcTextSize("Clear all").X - style.FramePadding.X * 2 - style.ItemSpacing.X);
+        var clearWidth = ImGui.CalcTextSize("Clear all").X + style.FramePadding.X * 2;
+        ImGui.SetNextItemWidth(-clearWidth - style.ItemSpacing.X);
         ImGui.InputTextWithHint("##filter", "Search...", ref filter, 128);
 
         var changed = false;
@@ -71,36 +116,50 @@ internal static class SearchCombo
 
         using (ImRaii.Child("##items", new Vector2(0, ListHeight * ImGuiHelpers.GlobalScale)))
         {
+            var matches = FilterItems(items, out var truncated);
             string? section = null;
-            foreach (var c in Filtered(items, false))
+            foreach (var item in matches)
             {
-                if (c.Section != null && c.Section != section)
+                // Show a heading whenever the section changes.
+                if (item.Section != null && item.Section != section)
                 {
-                    if (section != null) ImGui.Spacing();
-                    section = c.Section;
+                    if (section != null)
+                        ImGui.Spacing();
+                    section = item.Section;
                     ImGui.TextDisabled(section);
                 }
 
-                var on = values.Contains(c.Id);
-                if (!ImGui.Checkbox($"{c.Label}##{c.Id}", ref on)) continue;
-                if (on) values.Add(c.Id);
-                else values.Remove(c.Id);
+                var on = values.Contains(item.Id);
+                if (!ImGui.Checkbox($"{item.Label}##{item.Id}", ref on))
+                    continue;
+                if (on)
+                    values.Add(item.Id);
+                else
+                    values.Remove(item.Id);
                 changed = true;
             }
+            DrawFilterNote(matches.Count == 0, truncated);
         }
 
         return changed;
     }
 
-    private static ImRaii.ComboDisposable Begin(string id, string preview, IReadOnlyList<Choice> items, Choice[] pinned,
-        float width, float extra)
+    // Opens the combo, focusing and clearing the search box the first frame it's open.
+    private static ImRaii.ComboDisposable Begin(
+        string id,
+        string preview,
+        IReadOnlyList<Choice> items,
+        Choice[] pinned,
+        float width,
+        float extra
+    )
     {
-        if (width > 0) ImGui.SetNextItemWidth(width);
+        if (width > 0)
+            ImGui.SetNextItemWidth(width);
         FitPopupTo(items, pinned, extra);
 
         var combo = ImRaii.Combo(id, preview, ImGuiComboFlags.HeightLargest);
-        bool open = combo;
-        if (open && ImGui.IsWindowAppearing())
+        if (combo.Success && ImGui.IsWindowAppearing())
         {
             filter = "";
             ImGui.SetKeyboardFocusHere();
@@ -108,40 +167,58 @@ internal static class SearchCombo
         return combo;
     }
 
-    /// <summary>Items matching the filter, capped at <see cref="MaxShown"/>, with a note when the cap or no match is hit.</summary>
-    private static IEnumerable<Choice> Filtered(IReadOnlyList<Choice> items, bool hasPinned)
+    // Items matching the filter, capped at MaxShown so huge lists stay fast.
+    private static List<Choice> FilterItems(IReadOnlyList<Choice> items, out bool truncated)
     {
-        var shown = 0;
-        foreach (var c in items)
+        truncated = false;
+        var matches = new List<Choice>();
+        foreach (var item in items)
         {
-            if (filter.Length > 0 && !c.Label.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
-            if (shown++ == MaxShown)
+            if (
+                filter.Length > 0
+                && !item.Label.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            )
+                continue;
+            if (matches.Count == MaxShown)
             {
-                ImGui.TextDisabled("Keep typing to narrow the list...");
-                yield break;
+                truncated = true;
+                break;
             }
-            yield return c;
+            matches.Add(item);
         }
-        if (shown == 0 && !hasPinned) ImGui.TextDisabled("No matches");
+        return matches;
     }
 
-    /// <summary>
-    /// A combo popup is only as wide as the combo itself, and the scrolling child inside doesn't
-    /// widen it, so set a minimum width that fits the longest label.
-    /// </summary>
+    private static void DrawFilterNote(bool empty, bool truncated)
+    {
+        if (truncated)
+            ImGui.TextDisabled("Keep typing to narrow the list...");
+        else if (empty)
+            ImGui.TextDisabled("No matches");
+    }
+
+    // Combo popups are only as wide as the combo, so make room for the longest label.
     private static void FitPopupTo(IReadOnlyList<Choice> items, Choice[] pinned, float extra)
     {
         if (!LabelWidths.TryGetValue(items, out var widest))
         {
-            if (LabelWidths.Count > 16) LabelWidths.Clear();
-            widest = items.Count == 0 ? 0 : items.Max(c => ImGui.CalcTextSize(c.Label).X);
+            if (LabelWidths.Count > 16)
+                LabelWidths.Clear();
+            widest = 0;
+            foreach (var item in items)
+                widest = Math.Max(widest, ImGui.CalcTextSize(item.Label).X);
             LabelWidths[items] = widest;
         }
-        foreach (var c in pinned) widest = Math.Max(widest, ImGui.CalcTextSize(c.Label).X);
+        foreach (var item in pinned)
+            widest = Math.Max(widest, ImGui.CalcTextSize(item.Label).X);
 
         var style = ImGui.GetStyle();
-        var min = widest + extra + style.WindowPadding.X * 2 + style.ScrollbarSize + style.ItemSpacing.X;
+        var min =
+            widest + extra + style.WindowPadding.X * 2 + style.ScrollbarSize + style.ItemSpacing.X;
         min = Math.Min(min, MaxPopupWidth * ImGuiHelpers.GlobalScale);
-        ImGui.SetNextWindowSizeConstraints(new Vector2(min, 0), new Vector2(float.MaxValue, float.MaxValue));
+        ImGui.SetNextWindowSizeConstraints(
+            new Vector2(min, 0),
+            new Vector2(float.MaxValue, float.MaxValue)
+        );
     }
 }

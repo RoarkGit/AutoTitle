@@ -1,26 +1,47 @@
-using Dalamud.Game.Command;
-using Dalamud.IoC;
-using Dalamud.Interface.Windowing;
-using Dalamud.Plugin;
-using Dalamud.Plugin.Services;
 using AutoTitle.Core;
 using AutoTitle.Windows;
+using Dalamud.Game.Command;
+using Dalamud.Interface.Windowing;
+using Dalamud.IoC;
+using Dalamud.Plugin;
+using Dalamud.Plugin.Services;
 
 namespace AutoTitle;
 
 public sealed class Plugin : IDalamudPlugin
 {
-    [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
-    [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
-    [PluginService] internal static IPluginLog Log { get; private set; } = null!;
-    [PluginService] internal static IFramework Framework { get; private set; } = null!;
-    [PluginService] internal static ICondition Condition { get; private set; } = null!;
-    [PluginService] internal static IClientState ClientState { get; private set; } = null!;
-    [PluginService] internal static IObjectTable Objects { get; private set; } = null!;
-    [PluginService] internal static IGameInventory Inventory { get; private set; } = null!;
-    [PluginService] internal static IPlayerState PlayerState { get; private set; } = null!;
-    [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
-    [PluginService] internal static IChatGui Chat { get; private set; } = null!;
+    [PluginService]
+    internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
+
+    [PluginService]
+    internal static ICommandManager CommandManager { get; private set; } = null!;
+
+    [PluginService]
+    internal static IPluginLog Log { get; private set; } = null!;
+
+    [PluginService]
+    internal static IFramework Framework { get; private set; } = null!;
+
+    [PluginService]
+    internal static ICondition Condition { get; private set; } = null!;
+
+    [PluginService]
+    internal static IClientState ClientState { get; private set; } = null!;
+
+    [PluginService]
+    internal static IObjectTable Objects { get; private set; } = null!;
+
+    [PluginService]
+    internal static IGameInventory Inventory { get; private set; } = null!;
+
+    [PluginService]
+    internal static IPlayerState PlayerState { get; private set; } = null!;
+
+    [PluginService]
+    internal static IDataManager DataManager { get; private set; } = null!;
+
+    [PluginService]
+    internal static IChatGui Chat { get; private set; } = null!;
 
     private const string CommandName = "/autotitle";
 
@@ -33,22 +54,27 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
+        // Load config and start watching for game events.
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
-        GameData = new GameData(DataManager);
-        Applier = new TitleApplier(Config, GameData, Framework, ClientState, Objects, PlayerState, Condition, Inventory,
-            DataManager, Chat, Log);
+        GameData = new GameData();
+        Applier = new TitleApplier(Config, GameData);
 
+        // Set up the settings window and command.
         mainWindow = new MainWindow(this);
         WindowSystem.AddWindow(mainWindow);
 
-        CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
-        {
-            HelpMessage = "Open the AutoTitle settings window.\n" +
-                          "/autotitle on: turn automatic titles on.\n" +
-                          "/autotitle off: turn automatic titles off.\n" +
-                          "/autotitle toggle: switch automatic titles on or off.\n" +
-                          "/autotitle apply: re-apply the title for your current situation.",
-        });
+        CommandManager.AddHandler(
+            CommandName,
+            new CommandInfo(OnCommand)
+            {
+                HelpMessage =
+                    "Open the AutoTitle settings window.\n"
+                    + "/autotitle on: turn automatic titles on.\n"
+                    + "/autotitle off: turn automatic titles off.\n"
+                    + "/autotitle toggle: switch automatic titles on or off.\n"
+                    + "/autotitle apply: re-apply the title for your current situation.",
+            }
+        );
 
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMain;
@@ -67,6 +93,7 @@ public sealed class Plugin : IDalamudPlugin
         CommandManager.RemoveHandler(CommandName);
     }
 
+    // Handles /autotitle, opening the window if there are no arguments.
     private void OnCommand(string command, string args)
     {
         switch (args.Trim().ToLowerInvariant())
