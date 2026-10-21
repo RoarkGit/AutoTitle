@@ -4,7 +4,6 @@ public readonly record struct GameContext(
     uint JobId,
     IReadOnlyList<JobGroup> JobGroups,
     uint TerritoryId,
-    uint MapId,
     uint DutyId,
     uint DutyTypeId,
     uint Gearset,
@@ -15,7 +14,6 @@ public readonly record struct GameContext(
     {
         ConditionKind.Job => JobId,
         ConditionKind.Zone => TerritoryId,
-        ConditionKind.Map => MapId,
         ConditionKind.Duty => DutyId,
         ConditionKind.DutyType => DutyTypeId,
         ConditionKind.Gearset => Gearset,

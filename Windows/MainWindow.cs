@@ -55,6 +55,8 @@ public sealed class MainWindow : Window
 
     public override void OnOpen()
     {
+        plugin.Applier.LoadTitleList();
+
         // Start on whichever settings are in effect for the logged-in character.
         var id = plugin.Applier.CharacterId;
         selected = Cfg.Characters.TryGetValue(id, out var p) && p.UseOwnRules ? id : null;
@@ -63,6 +65,7 @@ public sealed class MainWindow : Window
     public override void Draw()
     {
         dirty = false;
+        plugin.Applier.CheckTitleList();
 
         DrawHeader();
         ImGui.Spacing();
@@ -79,7 +82,9 @@ public sealed class MainWindow : Window
             DrawRules();
         }
 
-        if (dirty) Cfg.Save();
+        if (!dirty) return;
+        Cfg.Save();
+        plugin.Applier.Refresh();
     }
 
     private void DrawHeader()

@@ -17,6 +17,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal static ICondition Condition { get; private set; } = null!;
     [PluginService] internal static IClientState ClientState { get; private set; } = null!;
     [PluginService] internal static IObjectTable Objects { get; private set; } = null!;
+    [PluginService] internal static IGameInventory Inventory { get; private set; } = null!;
     [PluginService] internal static IPlayerState PlayerState { get; private set; } = null!;
     [PluginService] internal static IDataManager DataManager { get; private set; } = null!;
     [PluginService] internal static IChatGui Chat { get; private set; } = null!;
@@ -33,8 +34,11 @@ public sealed class Plugin : IDalamudPlugin
     public Plugin()
     {
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        Config.Migrate();
         GameData = new GameData(DataManager);
-        Applier = new TitleApplier(Config, GameData, ClientState, Objects, PlayerState, Condition, DataManager, Chat, Log);
+        Config.MergeValues(GameData);
+        Applier = new TitleApplier(Config, GameData, Framework, ClientState, Objects, PlayerState, Condition, Inventory,
+            DataManager, Chat, Log);
 
         mainWindow = new MainWindow(this);
         WindowSystem.AddWindow(mainWindow);
@@ -51,12 +55,10 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenMainUi += ToggleMain;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleMain;
-        Framework.Update += OnFrameworkUpdate;
     }
 
     public void Dispose()
     {
-        Framework.Update -= OnFrameworkUpdate;
         PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
         PluginInterface.UiBuilder.OpenMainUi -= ToggleMain;
         PluginInterface.UiBuilder.OpenConfigUi -= ToggleMain;
@@ -66,9 +68,6 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.RemoveHandler(CommandName);
     }
-
-    private void OnFrameworkUpdate(IFramework framework) =>
-        Applier.Update((float)framework.UpdateDelta.TotalSeconds);
 
     private void OnCommand(string command, string args)
     {
@@ -96,6 +95,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         Config.Enabled = enabled;
         Config.Save();
+        Applier.Refresh();
         Chat.Print(enabled ? "Enabled." : "Disabled.", "AutoTitle");
     }
 

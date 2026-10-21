@@ -19,7 +19,7 @@ The conditions you can use are:
 - Job, either individual jobs or groups like tanks, healers, melee DPS, or Disciples of the Hand
 - Duty type, such as dungeons, trials, raids, Ultimates, deep dungeons, or PvP
 - Duty, for a specific dungeon, trial, or raid
-- Zone and map
+- Zone, such as a city, a field area, a housing ward, or inside a house
 - Gearset
 
 Next to each rule is an icon showing whether it's the one in use right now, whether it matches but
@@ -38,6 +38,10 @@ AutoTitle only changes your title when your rules point to a different one than 
 you log in. If you change your title by hand, it stays that way until you switch jobs, zones, and
 so on. It also waits until you've finished zoning or watching a cutscene, and it skips any title
 your character hasn't unlocked.
+
+To know which titles you have, AutoTitle needs the game's title list, which the game only loads
+when asked. Open `/autotitle` once on each character (or the game's own Titles window) and it's
+saved from then on. Until then, AutoTitle leaves your title alone.
 
 ## Installing
 

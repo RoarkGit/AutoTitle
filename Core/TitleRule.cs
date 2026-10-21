@@ -1,13 +1,13 @@
 namespace AutoTitle.Core;
 
+/// <summary>Stored in configs, so don't renumber. 2 was Map, removed in config version 2.</summary>
 public enum ConditionKind
 {
-    Job,
-    Zone,
-    Map,
-    Duty,
-    DutyType,
-    Gearset,
+    Job = 0,
+    Zone = 1,
+    Duty = 3,
+    DutyType = 4,
+    Gearset = 5,
 }
 
 /// <summary>Groups a Job condition can select instead of single jobs. Stored in configs, so don't renumber.</summary>
@@ -54,6 +54,12 @@ public sealed class CharacterProfile : IRuleSet
     public ushort? DefaultTitleId { get; set; }
 
     public List<TitleRule> Rules { get; set; } = [];
+
+    /// <summary>
+    /// The game's unlocked title bitmask, saved whenever it has one so later sessions can check
+    /// titles without asking the server. Null until it has been loaded once for this character.
+    /// </summary>
+    public List<byte>? UnlockedTitles { get; set; }
 
     public string Label => World.Length > 0 ? $"{Name} @ {World}" : Name;
 }
